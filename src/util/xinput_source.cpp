@@ -342,7 +342,7 @@ TinyString XInputSource::ConvertKeyToString(InputBindingKey key)
     }
     else if (key.source_subtype == InputSubclass::ControllerMotor)
     {
-      ret.format("XInput-{}/{}Motor", static_cast<u32>(key.source_index), key.data ? "Large" : "Small");
+      ret.format("XInput-{}/{}Motor", static_cast<u32>(key.source_index), (key.data == 0) ? "Large" : "Small");
     }
   }
 
