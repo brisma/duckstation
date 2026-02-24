@@ -1364,15 +1364,20 @@ void FullscreenUI::OpenAchievementsWindow()
     return;
   }
 
-  VideoThread::RunOnThread([]() {
+  const bool was_paused = System::IsPaused();
+
+  VideoThread::RunOnThread([was_paused]() {
     Initialize();
 
-    PauseForMenuOpen(false);
+    PauseForMenuOpen(was_paused, false);
     ForceKeyNavEnabled();
     EnqueueSoundEffect(SFX_NAV_ACTIVATE);
 
     BeginTransition(SHORT_TRANSITION_TIME, &SwitchToAchievements);
   });
+
+  if (!was_paused)
+    System::PauseSystem(true);
 }
 
 void FullscreenUI::AddSubsetInfo(const rc_client_subset_t* subset)
@@ -2144,15 +2149,20 @@ void FullscreenUI::OpenLeaderboardsWindow()
     return;
   }
 
-  VideoThread::RunOnThread([]() {
+  const bool was_paused = System::IsPaused();
+
+  VideoThread::RunOnThread([was_paused]() {
     Initialize();
 
-    PauseForMenuOpen(false);
+    PauseForMenuOpen(was_paused, false);
     ForceKeyNavEnabled();
     EnqueueSoundEffect(SFX_NAV_ACTIVATE);
 
     BeginTransition(SHORT_TRANSITION_TIME, &SwitchToLeaderboards);
   });
+
+  if (!was_paused)
+    System::PauseSystem(true);
 }
 
 void FullscreenUI::SwitchToLeaderboards()
