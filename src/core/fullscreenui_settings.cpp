@@ -4982,7 +4982,7 @@ void FullscreenUI::DrawAchievementsSettingsPage(std::unique_lock<std::mutex>& se
   DrawToggleSetting(bsi, FSUI_ICONVSTR(ICON_FA_DOWNLOAD, "Prefetch Badges"),
                     FSUI_VSTR("Downloads all locked achievement badges while starting the game. This will reduce "
                               "delays in the images being shown when unlocking achievements."),
-                    "Cheevos", "PrefetchBadges", false, enabled);
+                    "Cheevos", "PrefetchBadges", Settings::DEFAULT_ACHIEVEMENT_BADGE_PREFETCH, enabled);
 
   DrawEnumSetting(bsi, FSUI_ICONVSTR(ICON_FA_ENVELOPE, "Notification Location"),
                   FSUI_VSTR("Selects the screen location for achievement and leaderboard notifications."), "Cheevos",

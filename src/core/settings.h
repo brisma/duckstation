@@ -369,7 +369,7 @@ struct Settings : public GPUSettings
   bool achievements_leaderboard_trackers : 1 = true;
   bool achievements_sound_effects : 1 = true;
   bool achievements_progress_indicators : 1 = true;
-  bool achievements_prefetch_badges : 1 = false;
+  bool achievements_prefetch_badges : 1 = DEFAULT_ACHIEVEMENT_BADGE_PREFETCH;
   u8 achievements_notification_duration = DEFAULT_ACHIEVEMENT_NOTIFICATION_TIME;
   u8 achievements_leaderboard_duration = DEFAULT_LEADERBOARD_NOTIFICATION_TIME;
 
@@ -651,9 +651,11 @@ struct Settings : public GPUSettings
   static constexpr bool DEFAULT_SAVE_STATE_BACKUPS = true;
   static constexpr bool DEFAULT_FAST_BOOT_VALUE = false;
   static constexpr u16 DEFAULT_GDB_SERVER_PORT = 2345;
+  static constexpr bool DEFAULT_ACHIEVEMENT_BADGE_PREFETCH = true;
 #else
   static constexpr bool DEFAULT_SAVE_STATE_BACKUPS = false;
   static constexpr bool DEFAULT_FAST_BOOT_VALUE = true;
+  static constexpr bool DEFAULT_ACHIEVEMENT_BADGE_PREFETCH = false;
 #endif
 };
 

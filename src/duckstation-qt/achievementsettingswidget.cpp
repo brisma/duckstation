@@ -50,7 +50,8 @@ AchievementSettingsWidget::AchievementSettingsWidget(SettingsWindow* dialog, QWi
     Settings::DEFAULT_ACHIEVEMENT_NOTIFICATION_LOCATION, NotificationLocation::MaxCount);
   SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.leaderboardTrackers, "Cheevos", "LeaderboardTrackers", true);
   SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.soundEffects, "Cheevos", "SoundEffects", true);
-  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.prefetchBadges, "Cheevos", "PrefetchBadges", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.prefetchBadges, "Cheevos", "PrefetchBadges",
+                                               Settings::DEFAULT_ACHIEVEMENT_BADGE_PREFETCH);
   SettingWidgetBinder::BindWidgetToEnumSetting(
     sif, m_ui.challengeIndicatorMode, "Cheevos", "ChallengeIndicatorMode",
     &Settings::ParseAchievementChallengeIndicatorMode, &Settings::GetAchievementChallengeIndicatorModeName,
@@ -91,7 +92,7 @@ AchievementSettingsWidget::AchievementSettingsWidget(SettingsWindow* dialog, QWi
   dialog->registerWidgetHelp(
     m_ui.soundEffects, tr("Enable Sound Effects"), tr("Checked"),
     tr("Plays sound effects for events such as achievement unlocks and leaderboard submissions."));
-  dialog->registerWidgetHelp(m_ui.prefetchBadges, tr("Prefetch Badges"), tr("Unchecked"),
+  dialog->registerWidgetHelp(m_ui.prefetchBadges, tr("Prefetch Badges"), tr("Checked"),
                              tr("Downloads all locked achievement badges while starting the game. This will reduce "
                                 "delays in the images being shown when unlocking achievements."));
   dialog->registerWidgetHelp(m_ui.notificationLocation, tr("Notification Location"), tr("Top Left"),
