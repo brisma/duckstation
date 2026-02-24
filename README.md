@@ -36,7 +36,7 @@ Other features include:
  - "Fast boot" for skipping BIOS splash/intro.
  - Save state support, with runahead and rewind.
  - Windows, Linux, macOS support.
- - Supports reading directly from CD, bin/cue images, raw bin/img files, MAME CHD, single-track ECM, MDS/MDF, and unencrypted PBP formats.
+ - Supports reading directly from CD, bin/cue images, MAME CHD, single-track ECM, MDS/MDF, CCD, and unencrypted PBP formats.
  - Preloading of disc images to RAM to avoid disk sleeping hitches.
  - Merging of multi-disc games in game list/grid with memory cards shared between discs.
  - Automatic loading/applying of PPF patches.
