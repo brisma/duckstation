@@ -23,6 +23,7 @@
 #include "core/game_database.h"
 #include "core/game_list.h"
 #include "core/gdb_server.h"
+#include "core/mcp_server.h"
 #include "core/gpu.h"
 #include "core/gpu_backend.h"
 #include "core/gpu_hw_texture_cache.h"
@@ -113,8 +114,9 @@ static constexpr int BACKGROUND_CONTROLLER_POLLING_INTERVAL_WITHOUT_DEVICES = 10
 /// Poll at half the vsync rate for FSUI to reduce the chance of getting a press+release in the same frame.
 static constexpr int FULLSCREEN_UI_CONTROLLER_POLLING_INTERVAL = 8;
 
-/// Poll at 1ms when running GDB server. We can get rid of this once we move networking to its own thread.
+/// Poll at 1ms when running GDB/MCP server. We can get rid of this once we move networking to its own thread.
 static constexpr int GDB_SERVER_POLLING_INTERVAL = 1;
+static constexpr int MCP_SERVER_POLLING_INTERVAL = 1;
 
 //////////////////////////////////////////////////////////////////////////
 // Local function declarations
@@ -2100,6 +2102,8 @@ int CoreThread::getBackgroundControllerPollInterval() const
 {
   if (GDBServer::HasAnyClients())
     return GDB_SERVER_POLLING_INTERVAL;
+  else if (MCPServer::IsActive())
+    return MCP_SERVER_POLLING_INTERVAL;
   else if (m_video_thread_run_idle)
     return FULLSCREEN_UI_CONTROLLER_POLLING_INTERVAL;
   else if (InputManager::GetPollableDeviceCount() > 0)

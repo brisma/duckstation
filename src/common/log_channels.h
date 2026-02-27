@@ -23,6 +23,7 @@
   X(FileSystem)                                                                                                        \
   X(FullscreenUI)                                                                                                      \
   X(GDBServer)                                                                                                         \
+  X(MCPServer)                                                                                                         \
   X(GPU)                                                                                                               \
   X(GPUDevice)                                                                                                         \
   X(GPUDump)                                                                                                           \

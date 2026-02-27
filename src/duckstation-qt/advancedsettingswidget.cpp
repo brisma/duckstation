@@ -319,6 +319,9 @@ void AdvancedSettingsWidget::addTweakOptions()
   addBooleanTweakOption(m_dialog, m_ui.tweakOptionTable, tr("Enable GDB Server"), "Debug", "EnableGDBServer", false);
   addIntRangeTweakOption(m_dialog, m_ui.tweakOptionTable, tr("GDB Server Port"), "Debug", "GDBServerPort", 1, 65535,
                          Settings::DEFAULT_GDB_SERVER_PORT);
+  addBooleanTweakOption(m_dialog, m_ui.tweakOptionTable, tr("Enable MCP Server"), "Debug", "EnableMCPServer", false);
+  addIntRangeTweakOption(m_dialog, m_ui.tweakOptionTable, tr("MCP Server Port"), "Debug", "MCPServerPort", 1, 65535,
+                         Settings::DEFAULT_MCP_SERVER_PORT);
 
   addBooleanTweakOption(m_dialog, m_ui.tweakOptionTable, tr("Export Shared Memory"), "Hacks", "ExportSharedMemory",
                         false);
@@ -366,6 +369,8 @@ void AdvancedSettingsWidget::onResetToDefaultClicked()
     setBooleanTweakOption(m_ui.tweakOptionTable, i++, false);                // Allow booting without SBI file
     setBooleanTweakOption(m_ui.tweakOptionTable, i++, false);                // Enable GDB Server
     setIntRangeTweakOption(m_ui.tweakOptionTable, i++, Settings::DEFAULT_GDB_SERVER_PORT); // GDB Server Port
+    setBooleanTweakOption(m_ui.tweakOptionTable, i++, false);                              // Enable MCP Server
+    setIntRangeTweakOption(m_ui.tweakOptionTable, i++, Settings::DEFAULT_MCP_SERVER_PORT); // MCP Server Port
     setBooleanTweakOption(m_ui.tweakOptionTable, i++, false);                              // Export Shared Memory
     setBooleanTweakOption(m_ui.tweakOptionTable, i++, false);                              // Redirect SIO to TTY
     setBooleanTweakOption(m_ui.tweakOptionTable, i++, false);                              // Enable PCDRV
@@ -403,6 +408,8 @@ void AdvancedSettingsWidget::onResetToDefaultClicked()
   sif->DeleteValue("CDROM", "AllowBootingWithoutSBIFile");
   sif->DeleteValue("Debug", "EnableGDBServer");
   sif->DeleteValue("Debug", "GDBServerPort");
+  sif->DeleteValue("Debug", "EnableMCPServer");
+  sif->DeleteValue("Debug", "MCPServerPort");
   sif->DeleteValue("SIO", "RedirectToTTY");
   sif->DeleteValue("PCDrv", "Enabled");
   sif->DeleteValue("PCDrv", "EnableWrites");

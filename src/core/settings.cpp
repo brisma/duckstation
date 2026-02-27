@@ -517,6 +517,8 @@ void Settings::Load(const SettingsInterface& si, const SettingsInterface& contro
 #ifndef __ANDROID__
   enable_gdb_server = si.GetBoolValue("Debug", "EnableGDBServer");
   gdb_server_port = static_cast<u16>(si.GetUIntValue("Debug", "GDBServerPort", DEFAULT_GDB_SERVER_PORT));
+  enable_mcp_server = si.GetBoolValue("Debug", "EnableMCPServer");
+  mcp_server_port = static_cast<u16>(si.GetUIntValue("Debug", "MCPServerPort", DEFAULT_MCP_SERVER_PORT));
 #endif
 
   texture_replacements.enable_texture_replacements =
@@ -844,6 +846,8 @@ void Settings::Save(SettingsInterface& si, bool ignore_base) const
 #ifndef __ANDROID__
   si.SetBoolValue("Debug", "EnableGDBServer", enable_gdb_server);
   si.SetUIntValue("Debug", "GDBServerPort", gdb_server_port);
+  si.SetBoolValue("Debug", "EnableMCPServer", enable_mcp_server);
+  si.SetUIntValue("Debug", "MCPServerPort", mcp_server_port);
 #endif
 
   si.SetBoolValue("TextureReplacements", "EnableTextureReplacements", texture_replacements.enable_texture_replacements);
@@ -1125,6 +1129,7 @@ void Settings::ApplySettingRestrictions()
 
 #ifndef __ANDROID__
     enable_gdb_server = false;
+    enable_mcp_server = false;
 #endif
 
     gpu_show_vram = false;

@@ -100,8 +100,10 @@ LOG_CHANNEL(System);
 #ifndef __ANDROID__
 #define ENABLE_DISCORD_PRESENCE 1
 #define ENABLE_GDB_SERVER 1
+#define ENABLE_MCP_SERVER 1
 #define ENABLE_SOCKET_MULTIPLEXER 1
 #include "gdb_server.h"
+#include "mcp_server.h"
 #endif
 
 // #define PROFILE_MEMORY_SAVE_STATES 1
@@ -566,11 +568,20 @@ bool System::CoreThreadInitialize(Error* error)
     InitializeDiscordPresence();
 #endif
 
+#ifdef ENABLE_MCP_SERVER
+  if (g_settings.enable_mcp_server)
+    MCPServer::Initialize(g_settings.mcp_server_port);
+#endif
+
   return true;
 }
 
 void System::CoreThreadShutdown()
 {
+#ifdef ENABLE_MCP_SERVER
+  MCPServer::Shutdown();
+#endif
+
 #ifdef ENABLE_DISCORD_PRESENCE
   ShutdownDiscordPresence();
 #endif
@@ -1731,6 +1742,10 @@ void System::PauseSystem(bool paused)
     GDBServer::OnSystemPaused();
 #endif
 
+#ifdef ENABLE_MCP_SERVER
+    MCPServer::OnSystemPaused();
+#endif
+
     Host::OnSystemPaused();
     UpdateDisplayVSync();
     VideoThread::PresentCurrentFrame();
@@ -1746,6 +1761,10 @@ void System::PauseSystem(bool paused)
 
 #ifdef ENABLE_GDB_SERVER
     GDBServer::OnSystemResumed();
+#endif
+
+#ifdef ENABLE_MCP_SERVER
+    MCPServer::OnSystemResumed();
 #endif
 
     Host::OnSystemResumed();
@@ -2279,6 +2298,10 @@ void System::FrameDone()
 #ifdef ENABLE_SOCKET_MULTIPLEXER
   if (s_state.socket_multiplexer)
     s_state.socket_multiplexer->PollEventsWithTimeout(0);
+#endif
+
+#ifdef ENABLE_MCP_SERVER
+  MCPServer::OnFrameEnd();
 #endif
 
   // Save states for rewind and runahead.
@@ -4993,6 +5016,16 @@ void System::CheckForSettingsChanges(const Settings& old_settings)
       }
     }
   }
+
+#ifdef ENABLE_MCP_SERVER
+  if (g_settings.enable_mcp_server != old_settings.enable_mcp_server ||
+      g_settings.mcp_server_port != old_settings.mcp_server_port)
+  {
+    MCPServer::Shutdown();
+    if (g_settings.enable_mcp_server)
+      MCPServer::Initialize(g_settings.mcp_server_port);
+  }
+#endif
 
   if (g_settings.disable_background_input != old_settings.disable_background_input)
     InputManager::UpdateInputIgnoreState();

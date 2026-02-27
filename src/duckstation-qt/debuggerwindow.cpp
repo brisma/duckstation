@@ -10,6 +10,7 @@
 #include "core/bus.h"
 #include "core/cpu_code_cache.h"
 #include "core/cpu_core_private.h"
+#include "core/mcp_server.h"
 
 #include "common/assert.h"
 #include "common/log.h"
@@ -36,15 +37,33 @@ DebuggerWindow::DebuggerWindow(QWidget* parent /* = nullptr */)
   connectSignals();
   createModels();
   setMemoryViewRegion(Bus::MemoryRegion::RAM);
+
+  // Refresh debugger views after any MCP tool call modifies system state.
+  MCPServer::SetStateChangedCallback([]() {
+    DebuggerWindow* const win = g_main_window->getDebuggerWindow();
+    if (!win)
+      return;
+    win->refreshAll();
+    win->refreshBreakpointList();
+  });
+
   if (QtHost::IsSystemValid() && QtHost::IsSystemPaused())
     onSystemPaused();
   else if (QtHost::IsSystemValid())
     onSystemStarted();
   else
     onSystemDestroyed();
+
+  // Sync all views with current state (breakpoints, registers, etc. may have been
+  // modified externally via MCP before the window was opened).
+  refreshAll();
+  refreshBreakpointList();
 }
 
-DebuggerWindow::~DebuggerWindow() = default;
+DebuggerWindow::~DebuggerWindow()
+{
+  MCPServer::SetStateChangedCallback(nullptr);
+}
 
 void DebuggerWindow::onSystemStarted()
 {

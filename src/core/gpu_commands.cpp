@@ -8,6 +8,7 @@
 #include "gpu_helpers.h"
 #include "video_thread_commands.h"
 #include "interrupt_controller.h"
+#include "mcp_server.h"
 #include "system.h"
 
 #include "common/assert.h"
@@ -1125,6 +1126,9 @@ void GPU::FinishVRAMWrite()
                      m_vram_transfer.width, m_vram_transfer.height, sizeof(u16) * m_vram_transfer.width,
                      m_blit_buffer.data(), true);
     }
+
+    // Check MCP VRAM write watchpoints before updating VRAM.
+    MCPServer::OnVRAMWrite(m_vram_transfer.x, m_vram_transfer.y, m_vram_transfer.width, m_vram_transfer.height);
 
     UpdateVRAM(m_vram_transfer.x, m_vram_transfer.y, m_vram_transfer.width, m_vram_transfer.height,
                m_blit_buffer.data(), m_GPUSTAT.set_mask_while_drawing, m_GPUSTAT.check_mask_before_draw);
