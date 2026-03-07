@@ -25,6 +25,7 @@
 #include "core/game_database.h"
 #include "core/game_list.h"
 #include "core/gdb_server.h"
+#include "core/mcp_server.h"
 #include "core/gpu.h"
 #include "core/gpu_backend.h"
 #include "core/gpu_hw_texture_cache.h"
@@ -117,6 +118,9 @@ static constexpr int IDLE_UPDATE_INTERVAL_WHILE_DOWNLOADING = 10;
 
 /// Poll at 1ms when running GDB server. We can get rid of this once we move networking to its own thread.
 static constexpr int IDLE_UPDATE_INTERVAL_WITH_GDB_CLIENTS = 10;
+
+/// Poll at 1ms while the MCP server is listening, so tool calls are answered promptly.
+static constexpr int IDLE_UPDATE_INTERVAL_WITH_MCP_SERVER = 1;
 
 //////////////////////////////////////////////////////////////////////////
 // Local function declarations
@@ -2096,6 +2100,8 @@ int CoreThread::getBackgroundControllerPollInterval() const
     return IDLE_UPDATE_INTERVAL_WITH_FULLSCREEN_UI;
   else if (m_has_gdb_clients)
     return IDLE_UPDATE_INTERVAL_WITH_GDB_CLIENTS;
+  else if (MCPServer::IsActive())
+    return IDLE_UPDATE_INTERVAL_WITH_MCP_SERVER;
   else if (m_http_downloader_active)
     return IDLE_UPDATE_INTERVAL_WHILE_DOWNLOADING;
   else if (InputManager::GetPollableDeviceCount() > 0)

@@ -13,6 +13,7 @@
 #include "gpu_sw_rasterizer.h"
 #include "host.h"
 #include "interrupt_controller.h"
+#include "mcp_server.h"
 #include "performance_counters.h"
 #include "settings.h"
 #include "system.h"
@@ -3778,6 +3779,10 @@ void GPU::FinishVRAMWrite()
                      s_locals.vram_transfer.width, s_locals.vram_transfer.height,
                      sizeof(u16) * s_locals.vram_transfer.width, s_locals.blit_buffer.data(), true);
     }
+
+    // Check MCP VRAM write watchpoints before updating VRAM.
+    MCPServer::OnVRAMWrite(s_locals.vram_transfer.x, s_locals.vram_transfer.y, s_locals.vram_transfer.width,
+                           s_locals.vram_transfer.height);
 
     UpdateVRAM(s_locals.vram_transfer.x, s_locals.vram_transfer.y, s_locals.vram_transfer.width,
                s_locals.vram_transfer.height, s_locals.blit_buffer.data(), s_locals.GPUSTAT.set_mask_while_drawing,

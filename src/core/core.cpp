@@ -8,6 +8,7 @@
 #include "discord_presence.h"
 #include "gdb_server.h"
 #include "host.h"
+#include "mcp_server.h"
 #include "settings.h"
 #include "system.h"
 #include "system_private.h"
@@ -745,12 +746,21 @@ bool Core::CoreThreadInitialize(bool disable_worker_threads, Error* error)
     DiscordPresence::Initialize();
 #endif
 
+#ifdef ENABLE_MCP_SERVER
+  if (g_settings.enable_mcp_server)
+    MCPServer::Initialize(g_settings.mcp_server_port);
+#endif
+
   return true;
 }
 
 void Core::CoreThreadShutdown()
 {
   s_locals.async_task_queue.SetWorkerCount(0);
+
+#ifdef ENABLE_MCP_SERVER
+  MCPServer::Shutdown();
+#endif
 
 #ifdef ENABLE_DISCORD_PRESENCE
   DiscordPresence::Shutdown();
