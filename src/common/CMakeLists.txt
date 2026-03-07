@@ -26,6 +26,10 @@ add_library(common
   gsvector_nosimd.h
   gsvector_sse.h
   intrin.h
+  json_reader.cpp
+  json_reader.h
+  json_writer.cpp
+  json_writer.h
   hash_combine.h
   heap_array.h
   heterogeneous_containers.h
