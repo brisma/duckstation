@@ -10,8 +10,7 @@ on:
       - 'scripts/*'
   push:
     branches:
-      - master
-      - dev
+      - mcp
     paths-ignore:
       - '**.md'
       - 'appveyor.yml'
@@ -39,7 +38,7 @@ jobs:
     name: 📤 Create Release
     needs: [windows, linux-appimage, linux-cross-appimage, macos]
     runs-on: ubuntu-22.04
-    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/dev'
+    if: github.ref == 'refs/heads/mcp'
     steps:
       - name: Download Artifacts
         uses: actions/download-artifact@v8
@@ -50,38 +49,13 @@ jobs:
       - name: Display Downloaded Artifacts
         run: find ./artifacts/ -type f | sort
 
-      - name: Create Preview Release
-        if: github.ref == 'refs/heads/master'
-        uses: marvinpinto/action-automatic-releases@d68defdd11f9dcc7f52f35c1b7c236ee7513bcc1
-        with:
-          repo_token: "${{ secrets.GITHUB_TOKEN }}"
-          automatic_release_tag: "preview"
-          prerelease: true
-          title: "Latest Preview Build"
-          files: |
-            ./artifacts/duckstation-windows-x64-installer.exe
-            ./artifacts/duckstation-windows-x64-release.zip
-            ./artifacts/duckstation-windows-x64-release-symbols.zip
-            ./artifacts/duckstation-windows-x64-sse2-installer.exe
-            ./artifacts/duckstation-windows-x64-sse2-release.zip
-            ./artifacts/duckstation-windows-x64-sse2-release-symbols.zip
-            ./artifacts/duckstation-windows-arm64-installer.exe
-            ./artifacts/duckstation-windows-arm64-release.zip
-            ./artifacts/duckstation-windows-arm64-release-symbols.zip
-            ./artifacts/DuckStation-x64.AppImage
-            ./artifacts/DuckStation-x64-SSE2.AppImage
-            ./artifacts/DuckStation-arm64.AppImage
-            ./artifacts/DuckStation-armhf.AppImage
-            ./artifacts/duckstation-mac-release.zip
-
-      - name: Create Rolling Release
-        if: github.ref == 'refs/heads/dev'
+      - name: Create Release
         uses: marvinpinto/action-automatic-releases@d68defdd11f9dcc7f52f35c1b7c236ee7513bcc1
         with:
           repo_token: "${{ secrets.GITHUB_TOKEN }}"
           automatic_release_tag: "latest"
           prerelease: false
-          title: "Latest Rolling Release"
+          title: "Latest Build"
           files: |
             ./artifacts/duckstation-windows-x64-installer.exe
             ./artifacts/duckstation-windows-x64-release.zip
