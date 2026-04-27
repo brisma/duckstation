@@ -9,11 +9,15 @@
 #include "cpu_disasm.h"
 #include "dma.h"
 #include "gpu.h"
+#include "gpu_backend.h"
 #include "host.h"
 #include "settings.h"
 #include "spu.h"
 #include "system.h"
 #include "timers.h"
+#include "video_presenter.h"
+#include "video_thread.h"
+#include "video_thread_commands.h"
 
 #include "achievements.h"
 #include "cheats.h"
@@ -31,6 +35,7 @@
 #include "util/image.h"
 #include "util/ini_settings_interface.h"
 #include "util/input_manager.h"
+#include "util/gpu_device.h"
 #include "util/iso_reader.h"
 #include "util/media_capture.h"
 #include "util/postprocessing.h"
@@ -57,7 +62,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <optional>
 #include <random>
@@ -94,8 +101,29 @@ static constexpr size_t MAX_SSE_CLIENTS = 4;
 /// Frontend callback for post-tool-call UI refresh.
 static StateChangedCallback s_state_changed_callback;
 
+/// MCP-specific JSON-RPC error codes. JSON-RPC reserves -32000 to -32099 for application-
+/// defined server errors. Standard codes (-32600 InvalidRequest, -32601 MethodNotFound,
+/// -32602 InvalidParams, -32603 InternalError) are used directly where appropriate.
+static constexpr int MCP_ERR_SYSTEM_NOT_RUNNING = -32001;
+static constexpr int MCP_ERR_OPERATION_FAILED = -32002;
+static constexpr int MCP_ERR_PRECONDITION_FAILED = -32003;
+
 /// Optional Bearer token for authentication. Empty = no auth required.
 static std::string s_auth_token;
+
+/// Constant-time byte comparison. Avoids leaking match-prefix length via response timing
+/// when comparing auth tokens. Length mismatch still short-circuits (the length itself is
+/// usually not sensitive, and the alternative — iterating to max(a,b) — adds complexity
+/// without meaningful security benefit for fixed-length tokens).
+static bool ConstantTimeEqual(std::string_view a, std::string_view b)
+{
+  if (a.size() != b.size())
+    return false;
+  unsigned char acc = 0;
+  for (size_t i = 0; i < a.size(); ++i)
+    acc |= static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i]);
+  return acc == 0;
+}
 
 /// Allowed CORS origin. Empty string uses default "*" for backward compatibility.
 static std::string s_cors_origin;
@@ -105,6 +133,23 @@ static std::string s_mcp_session_id;
 
 /// Negotiated protocol version for the current session.
 static std::string s_negotiated_protocol_version;
+
+// ---- SSE replay buffer (Last-Event-ID resume per MCP 2025-11-25 §2.2) ----
+
+struct SSEEventRecord
+{
+  u64 id;
+  std::string event_name;
+  std::string data_json;
+};
+
+/// Ring buffer of recently sent SSE events. Cap total memory to avoid unbounded growth
+/// for chatty event streams (e.g. log streaming). Drops oldest entries when limits are hit.
+static constexpr size_t SSE_REPLAY_MAX_EVENTS = 512;
+static constexpr size_t SSE_REPLAY_MAX_BYTES = 256 * 1024;
+static std::deque<SSEEventRecord> s_sse_replay_buffer;
+static size_t s_sse_replay_bytes = 0;
+static u64 s_sse_next_event_id = 1;
 
 void SetStateChangedCallback(StateChangedCallback callback)
 {
@@ -124,6 +169,10 @@ public:
 
   bool IsSSE() const { return m_is_sse; }
   void SendSSEEvent(std::string_view event_name, std::string_view data_json);
+  /// Replay buffered SSE events with id > last_event_id to this client. Returns the
+  /// number of replayed events, or -1 if last_event_id is older than the oldest
+  /// retained event (gap — client missed events that fell out of the ring buffer).
+  int ReplaySSEEventsFrom(u64 last_event_id);
 
 protected:
   void OnConnected() override;
@@ -215,6 +264,13 @@ static u32 s_next_sequence_id = 1;
 static Log::Level s_log_stream_level = Log::Level::None;
 static bool s_log_stream_active = false;
 
+// ---- Async step tracking ----
+// Some tools (step_over, step_out) resume the CPU and return immediately, with the
+// actual completion signalled by a later pause. To let SSE clients distinguish a
+// step-completion pause from a user-initiated pause, we record the expected reason
+// here before resuming and emit it from OnSystemPaused.
+static std::string s_next_pause_reason; // "step_over", "step_out", etc. Empty = "user".
+
 // ---- Resource subscription state ----
 
 static std::vector<std::string> s_subscribed_resources;
@@ -234,6 +290,66 @@ static u32 s_snapshot_size = 0;
 
 static std::vector<std::string> s_mcp_temp_files;
 
+// ---- Session lifecycle helper ----
+
+/// Reset all per-session state. Called when a session is initialized (a new session
+/// supersedes any prior one) and when a session is terminated. Without this reset,
+/// a fresh client would inherit the previous session's memory scan results, snapshot,
+/// active input sequence, resource subscriptions, and log streaming state.
+static void ResetSessionState()
+{
+  s_active_sequence.reset();
+  s_subscribed_resources.clear();
+  s_memory_scan.ResetSearch();
+  s_memory_watch_list.ClearEntries();
+  s_memory_snapshot.clear();
+  s_memory_snapshot.shrink_to_fit();
+  s_snapshot_base_address = 0;
+  s_snapshot_size = 0;
+  s_log_stream_level = Log::Level::None;
+  s_log_stream_active = false;
+  s_auto_releases.clear();
+  s_sse_replay_buffer.clear();
+  s_sse_replay_bytes = 0;
+  s_sse_next_event_id = 1;
+  s_next_pause_reason.clear();
+}
+
+// ---- VRAM sync helpers ----
+// GPU::ReadVRAM / GPU::UpdateVRAM are private members of GPU. Reproduce their public
+// GPUBackend command path here so we can sync the CPU-side g_vram mirror with the GPU
+// (and push CPU writes to the GPU) without needing friend access. See gpu.cpp:1985,2003.
+
+static void SyncVRAMReadback(u16 x, u16 y, u16 width, u16 height)
+{
+  if ((!GPUBackend::IsUsingHardwareBackend() || g_settings.gpu_use_software_renderer_for_readbacks) &&
+      !g_settings.display_show_gpu_stats)
+  {
+    VideoThread::SyncThread(true);
+    return;
+  }
+  GPUBackendReadVRAMCommand* cmd = GPUBackend::NewReadVRAMCommand();
+  cmd->x = x;
+  cmd->y = y;
+  cmd->width = width;
+  cmd->height = height;
+  GPUBackend::PushCommandAndSync(cmd, true);
+}
+
+static void PushVRAMUpdate(u16 x, u16 y, u16 width, u16 height, const void* data, bool set_mask, bool check_mask)
+{
+  const u32 num_words = static_cast<u32>(width) * static_cast<u32>(height);
+  GPUBackendUpdateVRAMCommand* cmd = GPUBackend::NewUpdateVRAMCommand(num_words);
+  cmd->x = x;
+  cmd->y = y;
+  cmd->width = width;
+  cmd->height = height;
+  cmd->set_mask_while_drawing = set_mask;
+  cmd->check_mask_before_draw = check_mask;
+  std::memcpy(cmd->data, data, num_words * sizeof(u16));
+  GPUBackend::PushCommand(cmd);
+}
+
 // ---- Utility helpers for tool handlers ----
 
 static std::string GetMCPTempDir()
@@ -241,11 +357,51 @@ static std::string GetMCPTempDir()
   return Path::Combine(EmuFolders::Cache, "mcp");
 }
 
+/// TTL for MCP-generated temp files. Files older than this when GetMCPTempFilePath is
+/// called are deleted to keep the cache directory bounded for long-running emulators.
+static constexpr u64 MCP_TEMP_FILE_TTL_SECONDS = 60 * 60; // 1 hour
+
+/// Throttle for the on-demand sweep — avoid scanning the directory on every tool call
+/// when many are issued in rapid succession.
+static u64 s_mcp_temp_last_sweep = 0;
+static constexpr u64 MCP_TEMP_SWEEP_INTERVAL_SECONDS = 60;
+
+static void SweepStaleMCPTempFiles(const std::string& dir)
+{
+  const u64 now = static_cast<u64>(std::time(nullptr));
+  if (now < s_mcp_temp_last_sweep + MCP_TEMP_SWEEP_INTERVAL_SECONDS)
+    return;
+  s_mcp_temp_last_sweep = now;
+
+  FileSystem::FindResultsArray entries;
+  if (!FileSystem::FindFiles(dir.c_str(), "*",
+                             FILESYSTEM_FIND_FILES | FILESYSTEM_FIND_HIDDEN_FILES, &entries))
+    return;
+
+  for (const FILESYSTEM_FIND_DATA& entry : entries)
+  {
+    if (entry.Attributes & FILESYSTEM_FILE_ATTRIBUTE_DIRECTORY)
+      continue;
+    // ModificationTime is a Unix timestamp (seconds).
+    if (static_cast<u64>(entry.ModificationTime) + MCP_TEMP_FILE_TTL_SECONDS < now)
+    {
+      FileSystem::DeleteFile(entry.FileName.c_str());
+      // Also drop from our tracking vector if present so we don't try to delete twice on
+      // shutdown.
+      auto it = std::find(s_mcp_temp_files.begin(), s_mcp_temp_files.end(), entry.FileName);
+      if (it != s_mcp_temp_files.end())
+        s_mcp_temp_files.erase(it);
+    }
+  }
+}
+
 static std::string GetMCPTempFilePath(const char* prefix, const char* extension)
 {
   const std::string dir = GetMCPTempDir();
   if (!FileSystem::DirectoryExists(dir.c_str()))
     FileSystem::EnsureDirectoryExists(dir.c_str(), false, nullptr);
+  else
+    SweepStaleMCPTempFiles(dir);
 
   std::string path =
     Path::Combine(dir, fmt::format("{}_{:X}.{}", prefix, Timer::GetCurrentValue(), extension));
@@ -263,6 +419,86 @@ static void CleanupMCPTempFiles()
   const std::string dir = GetMCPTempDir();
   if (FileSystem::DirectoryExists(dir.c_str()))
     FileSystem::DeleteDirectory(dir.c_str());
+}
+
+/// Validate a client-supplied filesystem path before opening it. Rejects:
+///   - empty paths
+///   - relative paths (would resolve against the emulator's CWD, surprising)
+///   - paths containing literal ".." or "." components after canonicalization
+///   - Windows reserved device names (CON, PRN, NUL, AUX, COMx, LPTx, ...)
+/// On success, returns the canonicalized absolute path (with .. stripped lexically and
+/// symlinks unresolved — RealPath would fail for paths that don't exist yet, which is
+/// legal for output paths).
+///
+/// We intentionally do NOT restrict to a specific root: an MCP debugging session is a
+/// trusted local context and users may legitimately want screenshots/dumps written
+/// outside DataRoot. The goal here is to catch *unintended* traversal (typoed paths,
+/// LLM hallucinations producing "..\\..\\..\\Windows\\..." style escapes) rather than
+/// to sandbox a hostile client.
+static std::optional<std::string> ValidateMCPPath(std::string_view raw_path, std::string* error_out)
+{
+  const auto fail = [error_out](std::string msg) -> std::optional<std::string> {
+    if (error_out)
+      *error_out = std::move(msg);
+    return std::nullopt;
+  };
+
+  if (raw_path.empty())
+    return fail("path is empty");
+
+  if (!Path::IsAbsolute(raw_path))
+    return fail(fmt::format("path '{}' must be absolute", raw_path));
+
+  std::string canonical = Path::Canonicalize(raw_path);
+  if (canonical.empty())
+    return fail(fmt::format("path '{}' could not be canonicalized", raw_path));
+
+  // After canonicalization there should be no ".." or "." segments left. If any remain,
+  // they were unresolvable (e.g. ".." past the filesystem root); reject.
+  for (size_t i = 0; i < canonical.size();)
+  {
+    const size_t end = canonical.find_first_of("/\\", i);
+    const std::string_view seg(canonical.data() + i, (end == std::string::npos ? canonical.size() : end) - i);
+    if (seg == ".." || seg == ".")
+      return fail(fmt::format("path '{}' contains traversal segment", raw_path));
+    if (end == std::string::npos)
+      break;
+    i = end + 1;
+  }
+
+#ifdef _WIN32
+  // Reject Windows reserved device names. They can be specified with or without
+  // an extension (e.g. "CON.txt" still opens the CON device).
+  static constexpr const char* RESERVED_NAMES[] = {
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+  };
+  const std::string_view filename = Path::GetFileName(canonical);
+  // Compare against the part of the filename before the first '.', case-insensitively.
+  const std::string_view stem = filename.substr(0, filename.find('.'));
+  for (const char* reserved : RESERVED_NAMES)
+  {
+    if (StringUtil::EqualNoCase(stem, reserved))
+      return fail(fmt::format("path '{}' refers to a reserved device name", raw_path));
+  }
+#endif
+
+  return canonical;
+}
+
+/// Validate an args["<key>"] path argument. Combines presence/type check with
+/// ValidateMCPPath. Returns nullopt on failure (and populates *error_out with a message
+/// suitable for inclusion in a -32602 ToolResult::Error response).
+static std::optional<std::string> ValidatePathArg(const JsonValue& args, const char* key, std::string* error_out)
+{
+  if (!args.contains(key) || !args[key].is_string())
+  {
+    if (error_out)
+      *error_out = fmt::format("Missing or non-string '{}' parameter", key);
+    return std::nullopt;
+  }
+  return ValidateMCPPath(args[key].get_string(), error_out);
 }
 
 static std::optional<u32> ParseAddress(const JsonValue& val)
@@ -326,7 +562,7 @@ static std::optional<CPU::BreakpointType> ParseBreakpointType(const JsonValue& a
 static ToolResult HandlePressButton(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("button") || !args["button"].is_string())
     return ToolResult::Error(-32602, "Missing 'button' parameter");
@@ -340,7 +576,7 @@ static ToolResult HandlePressButton(const JsonValue& args)
 
   Controller* controller = GetControllerForSlot(slot);
   if (!controller)
-    return ToolResult::Error(-2, fmt::format("No controller in slot {}", slot));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("No controller in slot {}", slot));
 
   const std::string button_name = std::string(args["button"].get_string());
   const ControllerType type = controller->GetType();
@@ -371,7 +607,7 @@ static ToolResult HandlePressButton(const JsonValue& args)
 static ToolResult HandleReleaseButton(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("button") || !args["button"].is_string())
     return ToolResult::Error(-32602, "Missing 'button' parameter");
@@ -385,7 +621,7 @@ static ToolResult HandleReleaseButton(const JsonValue& args)
 
   Controller* controller = GetControllerForSlot(slot);
   if (!controller)
-    return ToolResult::Error(-2, fmt::format("No controller in slot {}", slot));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("No controller in slot {}", slot));
 
   const std::string button_name = std::string(args["button"].get_string());
   const ControllerType type = controller->GetType();
@@ -407,7 +643,7 @@ static ToolResult HandleReleaseButton(const JsonValue& args)
 static ToolResult HandleSetAnalog(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("stick") || !args["stick"].is_string())
     return ToolResult::Error(-32602, "Missing 'stick' parameter (\"left\" or \"right\")");
@@ -425,7 +661,7 @@ static ToolResult HandleSetAnalog(const JsonValue& args)
 
   Controller* controller = GetControllerForSlot(slot);
   if (!controller)
-    return ToolResult::Error(-2, fmt::format("No controller in slot {}", slot));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("No controller in slot {}", slot));
 
   const std::string stick = std::string(args["stick"].get_string());
   const float x = std::clamp(static_cast<float>(args["x"].get_float()), -1.0f, 1.0f);
@@ -490,7 +726,7 @@ static ToolResult HandleSetAnalog(const JsonValue& args)
 static ToolResult HandleGetControllerState(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   u32 slot = 0;
   if (args.contains("slot") && args["slot"].is_number_unsigned())
@@ -501,7 +737,7 @@ static ToolResult HandleGetControllerState(const JsonValue& args)
 
   Controller* controller = GetControllerForSlot(slot);
   if (!controller)
-    return ToolResult::Error(-2, fmt::format("No controller in slot {}", slot));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("No controller in slot {}", slot));
 
   const ControllerType type = controller->GetType();
   const Controller::ControllerInfo& info = Controller::GetControllerInfo(type);
@@ -600,13 +836,13 @@ static ToolResult HandleListControllers([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleInputSequence(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("sequence") || !args["sequence"].is_array())
     return ToolResult::Error(-32602, "Missing 'sequence' array parameter");
 
   if (s_active_sequence.has_value())
-    return ToolResult::Error(-1, "An input sequence is already active");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"An input sequence is already active");
 
   u32 slot = 0;
   if (args.contains("slot") && args["slot"].is_number_unsigned())
@@ -617,7 +853,7 @@ static ToolResult HandleInputSequence(const JsonValue& args)
 
   Controller* controller = GetControllerForSlot(slot);
   if (!controller)
-    return ToolResult::Error(-2, fmt::format("No controller in slot {}", slot));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("No controller in slot {}", slot));
 
   const ControllerType type = controller->GetType();
   const JsonValue& seq_array = args["sequence"];
@@ -752,7 +988,7 @@ static ToolResult HandleSetSetting(const JsonValue& args)
   {
     if (!args["value"].is_number_unsigned())
       return ToolResult::Error(-32602, "ResolutionScale must be an unsigned integer");
-    const u32 scale = args["value"].get_uint();
+    const u32 scale = static_cast<u32>(args["value"].get_uint());
     if (scale < 1 || scale > 16)
       return ToolResult::Error(-32602, "GPU/ResolutionScale must be between 1 and 16");
     g_settings.gpu_resolution_scale = static_cast<u8>(scale);
@@ -840,7 +1076,7 @@ static ToolResult HandleSetSetting(const JsonValue& args)
 static ToolResult HandleSetSpeed(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (args.contains("speed") && args["speed"].is_number())
   {
@@ -873,18 +1109,100 @@ static ToolResult HandleSetSpeed(const JsonValue& args)
 static ToolResult HandleTakeScreenshot(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
-  const std::string path = (args.contains("path") && args["path"].is_string())
-    ? std::string(args["path"].get_string())
-    : GetMCPTempFilePath("screenshot", "png");
+  std::string path;
+  if (args.contains("path") && args["path"].is_string())
+  {
+    std::string err;
+    auto vp = ValidateMCPPath(args["path"].get_string(), &err);
+    if (!vp)
+      return ToolResult::Error(-32602, std::move(err));
+    path = std::move(*vp);
+  }
+  else
+  {
+    path = GetMCPTempFilePath("screenshot", "png");
+  }
 
-  System::SaveScreenshot(path.c_str());
+  const DisplayScreenshotMode mode = g_settings.display_screenshot_mode;
+  const u8 quality = g_settings.display_screenshot_quality;
+
+  // Capture and save synchronously on the video thread so the tool's response only fires
+  // once the file is actually on disk. We pay a brief video-thread stall in exchange for
+  // request->result atomicity.
+  bool success = false;
+  std::string error_msg;
+  u32 result_width = 0;
+  u32 result_height = 0;
+
+  VideoThread::RunOnThreadAndSync([&]() {
+    GPUBackend* const backend = VideoThread::GetGPUBackend();
+    if (!backend)
+    {
+      error_msg = "GPU backend not available";
+      return;
+    }
+
+    const GSVector2i size = VideoPresenter::CalculateScreenshotSize(mode);
+    if (size.x == 0 || size.y == 0)
+    {
+      error_msg = "Invalid screenshot size";
+      return;
+    }
+
+    const bool internal_resolution = (mode != DisplayScreenshotMode::ScreenResolution);
+    const bool apply_aspect_ratio = (mode != DisplayScreenshotMode::UncorrectedInternalResolution);
+
+    Error error;
+    Image image;
+    if (!VideoPresenter::RenderScreenshotToBuffer(static_cast<u32>(size.x), static_cast<u32>(size.y),
+                                                  !internal_resolution, apply_aspect_ratio, &image, &error))
+    {
+      error_msg = fmt::format("Failed to render {}x{} screenshot: {}", size.x, size.y, error.GetDescription());
+      backend->RestoreDeviceContext();
+      return;
+    }
+
+    backend->RestoreDeviceContext();
+
+    if (g_gpu_device->UsesLowerLeftOrigin())
+      image.FlipY();
+
+    if (image.GetFormat() != ImageFormat::RGBA8)
+    {
+      std::optional<Image> convert_image = image.ConvertToRGBA8(&error);
+      if (!convert_image.has_value())
+      {
+        error_msg = fmt::format("Failed to convert {} screenshot to RGBA8: {}",
+                                Image::GetFormatName(image.GetFormat()), error.GetDescription());
+        return;
+      }
+      image = std::move(convert_image.value());
+    }
+
+    image.SetAllPixelsOpaque();
+
+    if (!image.SaveToFile(path.c_str(), quality, &error))
+    {
+      error_msg = fmt::format("Failed to save screenshot to '{}': {}", path, error.GetDescription());
+      return;
+    }
+
+    result_width = static_cast<u32>(size.x);
+    result_height = static_cast<u32>(size.y);
+    success = true;
+  });
+
+  if (!success)
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,error_msg.empty() ? "Screenshot failed" : error_msg);
 
   JsonWriter w;
   w.StartObject();
   w.KeyString("status", "screenshot_saved");
   w.KeyString("path", path);
+  w.KeyUint("width", result_width);
+  w.KeyUint("height", result_height);
   w.EndObject();
   return ToolResult{w.TakeOutput()};
 }
@@ -894,7 +1212,7 @@ static ToolResult HandleTakeScreenshot(const JsonValue& args)
 static ToolResult HandleListCheats(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   bool want_cheats = true;
   bool want_patches = true;
@@ -961,7 +1279,7 @@ static ToolResult HandleListCheats(const JsonValue& args)
 static ToolResult HandleApplyCheat(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("name") || !args["name"].is_string())
     return ToolResult::Error(-32602, "Missing 'name' parameter");
@@ -969,7 +1287,7 @@ static ToolResult HandleApplyCheat(const JsonValue& args)
   const std::string name = std::string(args["name"].get_string());
 
   if (!Cheats::ApplyManualCode(name))
-    return ToolResult::Error(-2, fmt::format("Failed to apply cheat: {}", name));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to apply cheat: {}", name));
 
   JsonWriter w;
   w.StartObject();
@@ -982,7 +1300,7 @@ static ToolResult HandleApplyCheat(const JsonValue& args)
 static ToolResult HandleToggleCheat(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("name") || !args["name"].is_string())
     return ToolResult::Error(-32602, "Missing 'name' parameter");
@@ -997,7 +1315,7 @@ static ToolResult HandleToggleCheat(const JsonValue& args)
   auto lock = Core::GetSettingsLock();
   SettingsInterface* sif = Core::GetGameSettingsLayer();
   if (!sif)
-    return ToolResult::Error(-2, "No game settings available (no game loaded?)");
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"No game settings available (no game loaded?)");
 
   // Check current state.
   const std::vector<std::string> enabled_list = sif->GetStringList("Cheats", "Enable");
@@ -1032,7 +1350,7 @@ static ToolResult HandleToggleCheat(const JsonValue& args)
 static ToolResult HandleGetCheatStatus([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   JsonWriter w;
   w.StartObject();
@@ -1049,18 +1367,25 @@ static ToolResult HandleGetCheatStatus([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleInsertDisc(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("path") || !args["path"].is_string())
     return ToolResult::Error(-32602, "Missing 'path' parameter");
 
-  const std::string path = std::string(args["path"].get_string());
+  std::string path;
+  {
+    std::string err;
+    auto vp = ValidatePathArg(args, "path", &err);
+    if (!vp)
+      return ToolResult::Error(-32602, std::move(err));
+    path = std::move(*vp);
+  }
 
   if (!FileSystem::FileExists(path.c_str()))
-    return ToolResult::Error(-2, fmt::format("File not found: {}", path));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("File not found: {}", path));
 
   if (!System::InsertMedia(path.c_str()))
-    return ToolResult::Error(-2, fmt::format("Failed to insert disc: {}", path));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to insert disc: {}", path));
 
   JsonWriter w;
   w.StartObject();
@@ -1073,7 +1398,7 @@ static ToolResult HandleInsertDisc(const JsonValue& args)
 static ToolResult HandleEjectDisc([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   System::RemoveMedia();
 
@@ -1087,13 +1412,13 @@ static ToolResult HandleEjectDisc([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleSwitchDisc(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (args.contains("index") && args["index"].is_number_unsigned())
   {
     const u32 index = static_cast<u32>(args["index"].get_uint());
     if (!System::SwitchMediaSubImage(index))
-      return ToolResult::Error(-2, fmt::format("Failed to switch to disc index {}", index));
+      return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to switch to disc index {}", index));
 
     JsonWriter w;
     w.StartObject();
@@ -1115,7 +1440,7 @@ static ToolResult HandleSwitchDisc(const JsonValue& args)
       return ToolResult::Error(-32602, "Invalid direction. Use 'next' or 'previous'.");
 
     if (!success)
-      return ToolResult::Error(-2, fmt::format("Failed to switch to {} disc", direction));
+      return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to switch to {} disc", direction));
 
     JsonWriter w;
     w.StartObject();
@@ -1131,7 +1456,7 @@ static ToolResult HandleSwitchDisc(const JsonValue& args)
 static ToolResult HandleListDiscs([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   JsonWriter w;
   w.StartObject();
@@ -1197,7 +1522,7 @@ static ToolResult HandleListSaveStates([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleSwapMemoryCards([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   System::SwapMemoryCards();
 
@@ -1211,15 +1536,22 @@ static ToolResult HandleSwapMemoryCards([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleBootGame(const JsonValue& args)
 {
   if (System::IsValid())
-    return ToolResult::Error(-1, "System is already running. Shut down first.");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System is already running. Shut down first.");
 
   if (!args.contains("path") || !args["path"].is_string())
     return ToolResult::Error(-32602, "Missing 'path' parameter");
 
-  const std::string path = std::string(args["path"].get_string());
+  std::string path;
+  {
+    std::string err;
+    auto vp = ValidatePathArg(args, "path", &err);
+    if (!vp)
+      return ToolResult::Error(-32602, std::move(err));
+    path = std::move(*vp);
+  }
 
   if (!FileSystem::FileExists(path.c_str()))
-    return ToolResult::Error(-2, fmt::format("File not found: {}", path));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("File not found: {}", path));
 
   SystemBootParameters params(path);
 
@@ -1233,7 +1565,7 @@ static ToolResult HandleBootGame(const JsonValue& args)
   Error error;
   if (!System::BootSystem(std::move(params), &error))
   {
-    return ToolResult::Error(-2, fmt::format("Failed to boot game: {}", error.GetDescription()));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to boot game: {}", error.GetDescription()));
   }
 
   JsonWriter w;
@@ -1247,7 +1579,7 @@ static ToolResult HandleBootGame(const JsonValue& args)
 static ToolResult HandleShutdownSystem(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   bool save_resume_state = true;
   if (args.contains("save_resume_state") && args["save_resume_state"].is_bool())
@@ -1271,7 +1603,7 @@ static ToolResult HandleShutdownSystem(const JsonValue& args)
 static ToolResult HandleReadRegisters(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   std::string group = "all";
   if (args.contains("group") && args["group"].is_string())
@@ -1308,7 +1640,7 @@ static ToolResult HandleReadRegisters(const JsonValue& args)
 static ToolResult HandleWriteRegister(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("name") || !args["name"].is_string())
     return ToolResult::Error(-32602, "Missing 'name' parameter");
@@ -1343,13 +1675,13 @@ static ToolResult HandleWriteRegister(const JsonValue& args)
     }
   }
 
-  return ToolResult::Error(-2, fmt::format("Unknown register: {}", name));
+  return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Unknown register: {}", name));
 }
 
 static ToolResult HandleDisassemble(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   std::optional<u32> address;
   if (args.contains("address"))
@@ -1360,6 +1692,10 @@ static ToolResult HandleDisassemble(const JsonValue& args)
   u32 count = 20;
   if (args.contains("count") && args["count"].is_number())
     count = static_cast<u32>(args["count"].get_uint());
+  // Cap at a few KB of disassembly to bound the JSON response for an LLM client.
+  static constexpr u32 MAX_DISASM_COUNT = 1000;
+  if (count == 0 || count > MAX_DISASM_COUNT)
+    count = MAX_DISASM_COUNT;
 
   JsonWriter w;
   w.StartArray();
@@ -1399,7 +1735,7 @@ static ToolResult HandleDisassemble(const JsonValue& args)
 static ToolResult HandleStepInto([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   System::SingleStepCPU();
 
@@ -1410,14 +1746,32 @@ static ToolResult HandleStepInto([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleStepOver([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
-  CPU::AddStepOverBreakpoint();
+  // AddStepOverBreakpoint returns false when the current PC isn't a call (or a delay
+  // slot is itself a branch). Match the Qt debugger: fall back to a single step rather
+  // than resuming with no breakpoint, which would run forever.
+  if (!CPU::AddStepOverBreakpoint())
+  {
+    System::SingleStepCPU();
+    JsonWriter w;
+    w.StartObject();
+    w.KeyString("status", "stepped");
+    w.KeyString("kind", "step_over");
+    w.KeyBool("fell_back_to_step_into", true);
+    w.KeyString("hint", "Current PC is not a call — executed one instruction synchronously.");
+    w.EndObject();
+    return ToolResult{w.TakeOutput()};
+  }
+
+  s_next_pause_reason = "step_over";
   System::PauseSystem(false);
 
   JsonWriter w;
   w.StartObject();
-  w.KeyString("status", "step_over initiated, system resumed");
+  w.KeyString("status", "initiated");
+  w.KeyString("kind", "step_over");
+  w.KeyString("hint", "Async — wait for system_paused SSE event with reason='step_over' or poll get_status.");
   w.EndObject();
   return ToolResult{w.TakeOutput()};
 }
@@ -1425,18 +1779,33 @@ static ToolResult HandleStepOver([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleStepOut(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   u32 max_instructions = 10000;
   if (args.contains("max_instructions") && args["max_instructions"].is_number())
     max_instructions = static_cast<u32>(args["max_instructions"].get_uint());
 
-  CPU::AddStepOutBreakpoint(max_instructions);
+  // AddStepOutBreakpoint returns false when no return is found within max_instructions,
+  // or we aren't in a function with an obvious return. Don't resume in that case —
+  // resuming with no breakpoint set would run the CPU forever.
+  if (!CPU::AddStepOutBreakpoint(max_instructions))
+  {
+    return ToolResult::Error(
+      MCP_ERR_PRECONDITION_FAILED,
+      fmt::format("Could not find a return within {} instructions from PC=0x{:08X}. "
+                  "Are you inside a valid function?",
+                  max_instructions, CPU::g_state.pc));
+  }
+
+  s_next_pause_reason = "step_out";
   System::PauseSystem(false);
 
   JsonWriter w;
   w.StartObject();
-  w.KeyString("status", "step_out initiated, system resumed");
+  w.KeyString("status", "initiated");
+  w.KeyString("kind", "step_out");
+  w.KeyUint("max_instructions", max_instructions);
+  w.KeyString("hint", "Async — wait for system_paused SSE event with reason='step_out' or poll get_status.");
   w.EndObject();
   return ToolResult{w.TakeOutput()};
 }
@@ -1444,7 +1813,7 @@ static ToolResult HandleStepOut(const JsonValue& args)
 static ToolResult HandlePause([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   System::PauseSystem(true);
 
@@ -1458,7 +1827,7 @@ static ToolResult HandlePause([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleContinue([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   System::PauseSystem(false);
 
@@ -1478,7 +1847,7 @@ static void BroadcastSSEEvent(std::string_view event_name, std::string_view data
 static ToolResult HandleAddBreakpoint(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("type") || !args["type"].is_string())
     return ToolResult::Error(-32602, "Missing 'type' parameter");
@@ -1500,13 +1869,24 @@ static ToolResult HandleAddBreakpoint(const JsonValue& args)
   else
     return ToolResult::Error(-32602, fmt::format("Unknown breakpoint type: {}", type_str));
 
-  if (!CPU::AddBreakpoint(bp_type, address.value()))
-    return ToolResult::Error(-2, "Failed to add breakpoint (may already exist)");
+  // Idempotent: if a matching breakpoint is already present, treat it as success rather
+  // than returning an ambiguous error. The LLM can re-issue set_breakpoint freely.
+  bool existed = false;
+  if (CPU::HasBreakpointAtAddress(bp_type, address.value()))
+  {
+    existed = true;
+  }
+  else if (!CPU::AddBreakpoint(bp_type, address.value()))
+  {
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to add {} breakpoint at {}", type_str,
+                                             FormatHex32(address.value())));
+  }
 
   JsonWriter w;
   w.StartObject();
   w.KeyString("address", FormatHex32(address.value()));
   w.KeyString("type", type_str);
+  w.KeyBool("existed", existed);
   w.EndObject();
   return ToolResult{w.TakeOutput()};
 }
@@ -1514,7 +1894,7 @@ static ToolResult HandleAddBreakpoint(const JsonValue& args)
 static ToolResult HandleRemoveBreakpoint(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("type") || !args["type"].is_string())
     return ToolResult::Error(-32602, "Missing 'type' parameter");
@@ -1537,7 +1917,7 @@ static ToolResult HandleRemoveBreakpoint(const JsonValue& args)
     return ToolResult::Error(-32602, fmt::format("Unknown breakpoint type: {}", type_str));
 
   if (!CPU::RemoveBreakpoint(bp_type, address.value()))
-    return ToolResult::Error(-2, "Breakpoint not found");
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"Breakpoint not found");
 
   JsonWriter w;
   w.StartObject();
@@ -1551,7 +1931,7 @@ static ToolResult HandleRemoveBreakpoint(const JsonValue& args)
 static ToolResult HandleListBreakpoints([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   const CPU::BreakpointList bps = CPU::CopyBreakpointList(false, true);
   JsonWriter w;
@@ -1653,7 +2033,7 @@ static std::vector<u8> Base64Decode(std::string_view encoded)
 static ToolResult HandleReadMemory(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("address"))
     return ToolResult::Error(-32602, "Missing 'address' parameter");
@@ -1676,16 +2056,34 @@ static ToolResult HandleReadMemory(const JsonValue& args)
   // Optional: write to file instead of returning inline data.
   const bool output_to_file = args.contains("path") && args["path"].is_string();
 
+  // Inline encodings inflate the response (hex 2x, base64 ~1.33x) and consume LLM context.
+  // Above this threshold, require the caller to provide a 'path' for binary output.
+  static constexpr u32 MAX_INLINE_READ_SIZE = 65536;
+  if (!output_to_file && size > MAX_INLINE_READ_SIZE)
+  {
+    return ToolResult::Error(-32602,
+                             fmt::format("Inline read limited to {} bytes; for size {} provide a 'path' parameter and "
+                                         "the bytes will be written there as raw binary",
+                                         MAX_INLINE_READ_SIZE, size));
+  }
+
   std::vector<u8> buffer(size);
   if (!CPU::SafeReadMemoryBytes(address.value(), buffer.data(), size))
-    return ToolResult::Error(-2, "Failed to read memory at specified address");
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"Failed to read memory at specified address");
 
   if (output_to_file)
   {
-    const std::string path = std::string(args["path"].get_string());
+    std::string path;
+  {
+    std::string err;
+    auto vp = ValidatePathArg(args, "path", &err);
+    if (!vp)
+      return ToolResult::Error(-32602, std::move(err));
+    path = std::move(*vp);
+  }
     Error error;
     if (!FileSystem::WriteBinaryFile(path.c_str(), buffer.data(), buffer.size(), &error))
-      return ToolResult::Error(-2, fmt::format("Failed to write file '{}': {}", path, error.GetDescription()));
+      return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to write file '{}': {}", path, error.GetDescription()));
 
     JsonWriter w;
     w.StartObject();
@@ -1714,7 +2112,7 @@ static ToolResult HandleReadMemory(const JsonValue& args)
 static ToolResult HandleWriteMemory(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("address"))
     return ToolResult::Error(-32602, "Missing 'address' parameter");
@@ -1728,11 +2126,18 @@ static ToolResult HandleWriteMemory(const JsonValue& args)
 
   if (input_from_file)
   {
-    const std::string path = std::string(args["path"].get_string());
+    std::string path;
+  {
+    std::string err;
+    auto vp = ValidatePathArg(args, "path", &err);
+    if (!vp)
+      return ToolResult::Error(-32602, std::move(err));
+    path = std::move(*vp);
+  }
     Error error;
     auto file_data = FileSystem::ReadBinaryFile(path.c_str(), &error);
     if (!file_data.has_value())
-      return ToolResult::Error(-2, fmt::format("Failed to read file '{}': {}", path, error.GetDescription()));
+      return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to read file '{}': {}", path, error.GetDescription()));
     buffer.assign(file_data->begin(), file_data->end());
   }
   else
@@ -1767,7 +2172,7 @@ static ToolResult HandleWriteMemory(const JsonValue& args)
     return ToolResult::Error(-32602, fmt::format("Data too large: {} bytes (max {})", buffer.size(), MAX_WRITE_SIZE));
 
   if (!CPU::SafeWriteMemoryBytes(address.value(), std::span<const u8>(buffer)))
-    return ToolResult::Error(-2, "Failed to write memory at specified address");
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"Failed to write memory at specified address");
 
   JsonWriter w;
   w.StartObject();
@@ -1780,7 +2185,7 @@ static ToolResult HandleWriteMemory(const JsonValue& args)
 static ToolResult HandleSearchMemory(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("pattern") || !args["pattern"].is_string())
     return ToolResult::Error(-32602, "Missing or invalid 'pattern' parameter");
@@ -1845,17 +2250,27 @@ static ToolResult HandleSearchMemory(const JsonValue& args)
 static ToolResult HandleDumpRam(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
-  const std::string path = (args.contains("path") && args["path"].is_string())
-    ? std::string(args["path"].get_string())
-    : GetMCPTempFilePath("ram_dump", "bin");
+  std::string path;
+  if (args.contains("path") && args["path"].is_string())
+  {
+    std::string err;
+    auto vp = ValidateMCPPath(args["path"].get_string(), &err);
+    if (!vp)
+      return ToolResult::Error(-32602, std::move(err));
+    path = std::move(*vp);
+  }
+  else
+  {
+    path = GetMCPTempFilePath("ram_dump", "bin");
+  }
   const u32 ram_size = Bus::g_ram_size;
 
   Error error;
   if (!FileSystem::WriteBinaryFile(path.c_str(), Bus::g_ram, ram_size, &error))
   {
-    return ToolResult::Error(-2, fmt::format("Failed to write file: {}", error.GetDescription()));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to write file: {}", error.GetDescription()));
   }
 
   JsonWriter w;
@@ -1871,7 +2286,7 @@ static ToolResult HandleDumpRam(const JsonValue& args)
 static ToolResult HandleGetGpuState([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   // Read GPUSTAT via the public ReadRegister interface (offset 0x04).
   const u32 gpustat = g_gpu.ReadRegister(0x04);
@@ -1901,7 +2316,7 @@ static ToolResult HandleGetGpuState([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleGetSpuState([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   // Read SPU registers via the public ReadRegister interface.
   // SPU_BASE = 0x1F801C00, register offsets are relative to SPU_BASE.
@@ -1933,7 +2348,7 @@ static ToolResult HandleGetSpuState([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleGetCdromState([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   const bool has_media = CDROM::HasMedia();
   const DiscRegion disc_region = CDROM::GetDiscRegion();
@@ -1973,7 +2388,7 @@ static ToolResult HandleGetCdromState([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleGetDmaState([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   static constexpr const char* CHANNEL_NAMES[DMA::NUM_CHANNELS] = {"MDECin", "MDECout", "GPU",  "CDROM",
                                                                     "SPU",    "PIO",     "OTC"};
@@ -2015,7 +2430,7 @@ static ToolResult HandleGetDmaState([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleGetTimersState([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   static constexpr const char* TIMER_NAMES[3] = {"Dotclock", "HBlank", "Sysclk/8"};
 
@@ -2052,18 +2467,31 @@ static ToolResult HandleGetTimersState([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleDumpVram(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   std::string format = "png";
   if (args.contains("format") && args["format"].is_string())
     format = std::string(args["format"].get_string());
 
-  const std::string path = (args.contains("path") && args["path"].is_string())
-    ? std::string(args["path"].get_string())
-    : GetMCPTempFilePath("vram_dump", format == "bin" ? "bin" : "png");
+  std::string path;
+  if (args.contains("path") && args["path"].is_string())
+  {
+    std::string err;
+    auto vp = ValidateMCPPath(args["path"].get_string(), &err);
+    if (!vp)
+      return ToolResult::Error(-32602, std::move(err));
+    path = std::move(*vp);
+  }
+  else
+  {
+    path = GetMCPTempFilePath("vram_dump", format == "bin" ? "bin" : "png");
+  }
 
   static constexpr u32 VRAM_W = VRAM_WIDTH;
   static constexpr u32 VRAM_H = VRAM_HEIGHT;
+
+  // Sync GPU-side VRAM into the CPU mirror. On hardware backends g_vram is otherwise stale.
+  SyncVRAMReadback(0, 0, VRAM_W, VRAM_H);
 
   Error error;
 
@@ -2073,7 +2501,7 @@ static ToolResult HandleDumpVram(const JsonValue& args)
     if (!FileSystem::WriteBinaryFile(path.c_str(), reinterpret_cast<const u8*>(g_vram),
                                      VRAM_W * VRAM_H * sizeof(u16), &error))
     {
-      return ToolResult::Error(-2, fmt::format("Failed to write file: {}", error.GetDescription()));
+      return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to write file: {}", error.GetDescription()));
     }
 
     JsonWriter w;
@@ -2111,7 +2539,7 @@ static ToolResult HandleDumpVram(const JsonValue& args)
 
     if (!img.SaveToFile(path.c_str(), Image::DEFAULT_SAVE_QUALITY, &error))
     {
-      return ToolResult::Error(-2, fmt::format("Failed to save PNG: {}", error.GetDescription()));
+      return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to save PNG: {}", error.GetDescription()));
     }
 
     JsonWriter w;
@@ -2132,17 +2560,27 @@ static ToolResult HandleDumpVram(const JsonValue& args)
 static ToolResult HandleDumpSpuRam(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
-  const std::string path = (args.contains("path") && args["path"].is_string())
-    ? std::string(args["path"].get_string())
-    : GetMCPTempFilePath("spu_ram_dump", "bin");
+  std::string path;
+  if (args.contains("path") && args["path"].is_string())
+  {
+    std::string err;
+    auto vp = ValidateMCPPath(args["path"].get_string(), &err);
+    if (!vp)
+      return ToolResult::Error(-32602, std::move(err));
+    path = std::move(*vp);
+  }
+  else
+  {
+    path = GetMCPTempFilePath("spu_ram_dump", "bin");
+  }
   const auto& spu_ram = SPU::GetRAM();
 
   Error error;
   if (!FileSystem::WriteBinaryFile(path.c_str(), spu_ram.data(), spu_ram.size(), &error))
   {
-    return ToolResult::Error(-2, fmt::format("Failed to write file: {}", error.GetDescription()));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to write file: {}", error.GetDescription()));
   }
 
   JsonWriter w;
@@ -2206,7 +2644,7 @@ static ToolResult HandleGetStatus([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleReset([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   System::ResetSystem();
 
@@ -2220,7 +2658,7 @@ static ToolResult HandleReset([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleSaveState(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("slot") || !args["slot"].is_number_integer())
     return ToolResult::Error(-32602, "Missing or invalid 'slot' parameter (integer 1-10)");
@@ -2242,7 +2680,7 @@ static ToolResult HandleSaveState(const JsonValue& args)
 static ToolResult HandleLoadState(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("slot") || !args["slot"].is_number_integer())
     return ToolResult::Error(-32602, "Missing or invalid 'slot' parameter (integer 1-10)");
@@ -2264,7 +2702,7 @@ static ToolResult HandleLoadState(const JsonValue& args)
 static ToolResult HandleFrameStep(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   // count parameter is accepted but we can only step one frame at a time.
   // The system will pause after 1 frame; the client can call frame_step again for more.
@@ -2329,7 +2767,7 @@ static ToolResult HandleRemoveVramWatch(const JsonValue& args)
                           [id](const VRAMWatch& w) { return w.id == id; });
 
   if (it == s_vram_watches.end())
-    return ToolResult::Error(-2, fmt::format("VRAM watch #{} not found", id));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("VRAM watch #{} not found", id));
 
   s_vram_watches.erase(it);
   JsonWriter w;
@@ -2364,7 +2802,7 @@ static ToolResult HandleListVramWatches([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleGetVramWatchLastHit([[maybe_unused]] const JsonValue& args)
 {
   if (!s_vram_watch_hit_pending)
-    return ToolResult::Error(-2, "No VRAM watch hit recorded");
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"No VRAM watch hit recorded");
 
   static constexpr const char* REG_NAMES[32] = {
     "zero","at","v0","v1","a0","a1","a2","a3",
@@ -2409,7 +2847,7 @@ static ToolResult HandleGetVramWatchLastHit([[maybe_unused]] const JsonValue& ar
 static ToolResult HandleGetCop0State([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   const auto& cop0 = CPU::g_state.cop0_regs;
 
@@ -2488,7 +2926,7 @@ static ToolResult HandleGetCop0State([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleGetCpuExecutionState([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   const auto& state = CPU::g_state;
 
@@ -2521,10 +2959,10 @@ static ToolResult HandleGetCpuExecutionState([[maybe_unused]] const JsonValue& a
 static ToolResult HandleStartTrace([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (CPU::IsTraceEnabled())
-    return ToolResult::Error(-2, "Trace already active");
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"Trace already active");
 
   CPU::StartTrace();
 
@@ -2539,10 +2977,10 @@ static ToolResult HandleStartTrace([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleStopTrace([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!CPU::IsTraceEnabled())
-    return ToolResult::Error(-2, "No trace active");
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"No trace active");
 
   CPU::StopTrace();
 
@@ -2557,7 +2995,7 @@ static ToolResult HandleStopTrace([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleGetTraceStatus([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   JsonWriter w;
   w.StartObject();
@@ -2569,7 +3007,7 @@ static ToolResult HandleGetTraceStatus([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleEnableBreakpoint(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("address"))
     return ToolResult::Error(-32602, "Missing 'address' parameter");
@@ -2583,7 +3021,7 @@ static ToolResult HandleEnableBreakpoint(const JsonValue& args)
     return ToolResult::Error(-32602, "Invalid breakpoint type (must be 'execute', 'read', or 'write')");
 
   if (!CPU::SetBreakpointEnabled(bp_type.value(), addr.value(), true))
-    return ToolResult::Error(-2, "Breakpoint not found at specified address");
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"Breakpoint not found at specified address");
 
   const char* type_name = CPU::GetBreakpointTypeName(bp_type.value());
   JsonWriter w;
@@ -2599,7 +3037,7 @@ static ToolResult HandleEnableBreakpoint(const JsonValue& args)
 static ToolResult HandleDisableBreakpoint(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("address"))
     return ToolResult::Error(-32602, "Missing 'address' parameter");
@@ -2613,7 +3051,7 @@ static ToolResult HandleDisableBreakpoint(const JsonValue& args)
     return ToolResult::Error(-32602, "Invalid breakpoint type (must be 'execute', 'read', or 'write')");
 
   if (!CPU::SetBreakpointEnabled(bp_type.value(), addr.value(), false))
-    return ToolResult::Error(-2, "Breakpoint not found at specified address");
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"Breakpoint not found at specified address");
 
   const char* type_name = CPU::GetBreakpointTypeName(bp_type.value());
   JsonWriter w;
@@ -2629,7 +3067,7 @@ static ToolResult HandleDisableBreakpoint(const JsonValue& args)
 static ToolResult HandleClearBreakpoints([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   CPU::ClearBreakpoints();
 
@@ -2645,7 +3083,7 @@ static ToolResult HandleClearBreakpoints([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleGetGteRegisters([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   // Data registers 0-31
   static constexpr const char* data_reg_names[] = {
@@ -2685,7 +3123,7 @@ static ToolResult HandleGetGteRegisters([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleSetGteRegister(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("index") || !args["index"].is_number_unsigned())
     return ToolResult::Error(-32602, "Missing 'index' parameter (0-63)");
@@ -2716,7 +3154,7 @@ static ToolResult HandleSetGteRegister(const JsonValue& args)
 static ToolResult HandleGetInterruptState([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   const u32 status = InterruptController::ReadRegister(0x00);
   const u32 mask = InterruptController::ReadRegister(0x04);
@@ -2753,7 +3191,7 @@ static ToolResult HandleGetInterruptState([[maybe_unused]] const JsonValue& args
 static ToolResult HandleGetSpuVoiceState(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   // Optional voice filter
   s32 voice_filter = -1;
@@ -2824,7 +3262,7 @@ static ToolResult HandleGetSpuVoiceState(const JsonValue& args)
 static ToolResult HandleGetGpuDrawState([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   // GPUSTAT contains many draw-related fields.
   const u32 gpustat = g_gpu.ReadRegister(0x04);
@@ -2873,7 +3311,7 @@ static ToolResult HandleGetGpuDrawState([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleGetGpuStats([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   // GPU statistics are available via the string formatters on the backend.
   // Since s_stats/s_counters are protected, we use GetStatsString/GetMemoryStatsString
@@ -2902,7 +3340,7 @@ static ToolResult HandleGetGpuStats([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleGetCdromExtendedState([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   const bool has_media = CDROM::HasMedia();
   const u8 status_reg = CDROM::ReadRegister(0);
@@ -2943,7 +3381,7 @@ static ToolResult HandleGetCdromExtendedState([[maybe_unused]] const JsonValue& 
 static ToolResult HandleGetMdecState([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   const u32 status = MDEC::ReadRegister(0x04); // Status register at offset 4
   const bool active = MDEC::IsActive();
@@ -2968,7 +3406,7 @@ static ToolResult HandleGetMdecState([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleGetMemoryMap([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   static constexpr const char* region_names[] = {
     "RAM", "RAM Mirror 1", "RAM Mirror 2", "RAM Mirror 3", "EXP1", "Scratchpad", "BIOS"
@@ -3071,7 +3509,7 @@ static ToolResult HandleGetMemoryMap([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleGetTimingEvents([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   const TimingEvent* event = *TimingEvents::GetHeadEventPtr();
   const GlobalTicks global_ticks = TimingEvents::GetGlobalTickCounter();
@@ -3117,12 +3555,19 @@ static ToolResult HandleGetTimingEvents([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleInjectExecutable(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("path") || !args["path"].is_string())
     return ToolResult::Error(-32602, "Missing 'path' parameter");
 
-  const std::string path = std::string(args["path"].get_string());
+  std::string path;
+  {
+    std::string err;
+    auto vp = ValidatePathArg(args, "path", &err);
+    if (!vp)
+      return ToolResult::Error(-32602, std::move(err));
+    path = std::move(*vp);
+  }
 
   bool set_pc = true;
   if (args.contains("set_pc") && args["set_pc"].is_bool())
@@ -3132,10 +3577,10 @@ static ToolResult HandleInjectExecutable(const JsonValue& args)
   Error error;
   auto data = FileSystem::ReadBinaryFile(path.c_str(), &error);
   if (!data.has_value())
-    return ToolResult::Error(-2, fmt::format("Failed to read file: {}", error.GetDescription()));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to read file: {}", error.GetDescription()));
 
   if (!Bus::InjectExecutable(data->cspan(), set_pc, &error))
-    return ToolResult::Error(-2, fmt::format("Failed to inject executable: {}", error.GetDescription()));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to inject executable: {}", error.GetDescription()));
 
   JsonWriter w;
   w.StartObject();
@@ -3150,10 +3595,10 @@ static ToolResult HandleInjectExecutable(const JsonValue& args)
 static ToolResult HandleStartGpuDump(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (g_gpu.GetGPUDump())
-    return ToolResult::Error(-2, "GPU dump already in progress");
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"GPU dump already in progress");
 
   u32 num_frames = 1;
   if (args.contains("num_frames") && args["num_frames"].is_number_unsigned())
@@ -3163,12 +3608,16 @@ static ToolResult HandleStartGpuDump(const JsonValue& args)
   std::string path_str;
   if (args.contains("path") && args["path"].is_string())
   {
-    path_str = std::string(args["path"].get_string());
+    std::string err;
+    auto vp = ValidateMCPPath(args["path"].get_string(), &err);
+    if (!vp)
+      return ToolResult::Error(-32602, std::move(err));
+    path_str = std::move(*vp);
     path = path_str.c_str();
   }
 
   if (!System::StartRecordingGPUDump(path, num_frames))
-    return ToolResult::Error(-2, "Failed to start GPU dump recording");
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"Failed to start GPU dump recording");
 
   JsonWriter w;
   w.StartObject();
@@ -3181,10 +3630,10 @@ static ToolResult HandleStartGpuDump(const JsonValue& args)
 static ToolResult HandleStopGpuDump([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!g_gpu.GetGPUDump())
-    return ToolResult::Error(-2, "No GPU dump in progress");
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"No GPU dump in progress");
 
   System::StopRecordingGPUDump();
 
@@ -3215,7 +3664,7 @@ static ToolResult HandleGetAchievementsState([[maybe_unused]] const JsonValue& a
     w.KeyBool("has_rich_presence", Achievements::HasRichPresence());
 
     auto lock = Achievements::GetLock();
-    w.KeyString("game_title", Achievements::GetGameTitle());
+    w.KeyString("game_title", Achievements::GetCurrentGameTitle());
     if (Achievements::HasRichPresence())
       w.KeyString("rich_presence", Achievements::GetRichPresenceString());
   }
@@ -3229,7 +3678,7 @@ static ToolResult HandleGetAchievementsState([[maybe_unused]] const JsonValue& a
 static ToolResult HandleGetGpuCrtcState([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   u32 beam_ticks = 0, beam_line = 0;
   g_gpu.GetBeamPosition(&beam_ticks, &beam_line);
@@ -3281,7 +3730,7 @@ static ToolResult HandleGetGpuCrtcState([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleGetSpuReverbState([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   // SPU reverb configuration registers (offsets relative to SPU base 0x1F801C00).
   // Reverb output volume: 0x1F801D84 => offset 0x184
@@ -3326,7 +3775,7 @@ static ToolResult HandleGetSpuReverbState([[maybe_unused]] const JsonValue& args
 static ToolResult HandleGetCpuIcacheState([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   const auto& state = CPU::g_state;
 
@@ -3415,7 +3864,7 @@ static ToolResult HandleGetCpuIcacheState([[maybe_unused]] const JsonValue& args
 static ToolResult HandleGetPgxpState([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   JsonWriter w;
   w.StartObject();
@@ -3436,7 +3885,7 @@ static ToolResult HandleGetPgxpState([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleGetEnhancedStatus([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   JsonWriter w;
   w.StartObject();
@@ -3450,7 +3899,7 @@ static ToolResult HandleGetEnhancedStatus([[maybe_unused]] const JsonValue& args
   w.KeyUint("frame_number", System::GetFrameNumber());
   w.KeyUint("internal_frame_number", System::GetInternalFrameNumber());
   w.KeyInt("global_tick_counter", static_cast<s64>(System::GetGlobalTickCounter()));
-  w.KeyDouble("session_played_time_seconds", System::GetSessionPlayedTime());
+  w.KeyDouble("session_played_time_seconds", static_cast<double>(System::GetSessionPlayedTime()));
   w.KeyUint("boot_mode", static_cast<u8>(System::GetBootMode()));
 
   // Taints
@@ -3537,8 +3986,14 @@ static ToolResult HandleListGames(const JsonValue& args)
     (args.contains("filter") && args["filter"].is_string()) ? args["filter"].get_string() : std::string_view();
   const std::string_view sort_by =
     (args.contains("sort_by") && args["sort_by"].is_string()) ? args["sort_by"].get_string() : std::string_view("title");
-  const s64 max_results =
-    (args.contains("max_results") && args["max_results"].is_number_integer()) ? args["max_results"].get_int() : 100;
+  // Hard cap to keep responses bounded for an LLM client. max_results <= 0 also caps to
+  // this value rather than meaning "all results" (which could blow context).
+  static constexpr s64 MAX_LIST_RESULTS = 1000;
+  s64 max_results = (args.contains("max_results") && args["max_results"].is_number_integer())
+                      ? args["max_results"].get_int()
+                      : 100;
+  if (max_results <= 0 || max_results > MAX_LIST_RESULTS)
+    max_results = MAX_LIST_RESULTS;
 
   auto lock = GameList::GetLock();
   const std::span<const GameList::Entry> entries = GameList::GetEntries();
@@ -3590,13 +4045,15 @@ static ToolResult HandleListGames(const JsonValue& args)
   }
 
   // Clamp to max_results.
-  const size_t count = (max_results > 0) ? std::min(matched.size(), static_cast<size_t>(max_results)) : matched.size();
+  const size_t count = std::min(matched.size(), static_cast<size_t>(max_results));
+  const bool truncated = (count < matched.size());
 
   JsonWriter w;
   w.StartObject();
   w.KeyUint("total_entries", static_cast<u64>(entries.size()));
   w.KeyUint("matched_entries", static_cast<u64>(matched.size()));
   w.KeyUint("returned_entries", static_cast<u64>(count));
+  w.KeyBool("truncated", truncated);
 
   w.Key("games");
   w.StartArray();
@@ -3626,7 +4083,7 @@ static ToolResult HandleGetGameInfo(const JsonValue& args)
     entry = GameList::GetEntryForPath(args["path"].get_string());
 
   if (!entry)
-    return ToolResult::Error(-1, "Game not found in game list");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"Game not found in game list");
 
   JsonWriter w;
   w.StartObject();
@@ -3767,7 +4224,7 @@ static ToolResult HandleGetBiosInfo(const JsonValue& args)
     }
   }
 
-  return ToolResult::Error(-1, fmt::format("BIOS file '{}' not found in directory '{}'", target_filename,
+  return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,fmt::format("BIOS file '{}' not found in directory '{}'", target_filename,
                                            EmuFolders::Bios));
 }
 
@@ -3800,14 +4257,14 @@ static ToolResult HandleGetSaveStateInfo(const JsonValue& args)
       serial = System::GetGameSerial();
 
     if (serial.empty())
-      return ToolResult::Error(-1, "No serial provided and no game is currently running");
+      return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"No serial provided and no game is currently running");
 
     path = System::GetGameSaveStatePath(serial, slot);
   }
 
   const std::optional<ExtendedSaveStateInfo> info = System::GetExtendedSaveStateInfo(path.c_str(), nullptr);
   if (!info.has_value())
-    return ToolResult::Error(-2, fmt::format("Save state not found or invalid at path: {}", path));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Save state not found or invalid at path: {}", path));
 
   JsonWriter w;
   w.StartObject();
@@ -3859,10 +4316,10 @@ static ToolResult HandleDeleteSaveStates(const JsonValue& args)
 static ToolResult HandleUndoLoadState([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!System::CanUndoLoadState())
-    return ToolResult::Error(-2, "No undo state available. A state must have been loaded first.");
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"No undo state available. A state must have been loaded first.");
 
   System::UndoLoadState();
 
@@ -3898,14 +4355,14 @@ static ToolResult HandleGetSaveStateScreenshot(const JsonValue& args)
       serial = System::GetGameSerial();
 
     if (serial.empty())
-      return ToolResult::Error(-1, "No serial provided and no game is currently running");
+      return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"No serial provided and no game is currently running");
 
     path = System::GetGameSaveStatePath(serial, slot);
   }
 
   const std::optional<ExtendedSaveStateInfo> info = System::GetExtendedSaveStateInfo(path.c_str(), nullptr);
   if (!info.has_value())
-    return ToolResult::Error(-2, fmt::format("Save state not found or invalid at path: {}", path));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Save state not found or invalid at path: {}", path));
 
   JsonWriter w;
   w.StartObject();
@@ -3951,7 +4408,7 @@ static ToolResult HandleGetSaveStateScreenshot(const JsonValue& args)
 static ToolResult HandleGetCheatDetails(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("name") || !args["name"].is_string())
     return ToolResult::Error(-32602, "Missing 'name' parameter");
@@ -3968,7 +4425,7 @@ static ToolResult HandleGetCheatDetails(const JsonValue& args)
     const Cheats::CodeInfoList patches = Cheats::GetCodeInfoList(serial, hash, false, true, true);
     code = Cheats::FindCodeInInfoList(patches, name);
     if (!code)
-      return ToolResult::Error(-2, fmt::format("Cheat not found: {}", name));
+      return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Cheat not found: {}", name));
   }
 
   JsonWriter w;
@@ -4009,7 +4466,7 @@ static ToolResult HandleGetCheatDetails(const JsonValue& args)
 static ToolResult HandleCreateCheat(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("name") || !args["name"].is_string())
     return ToolResult::Error(-32602, "Missing 'name' parameter");
@@ -4048,7 +4505,7 @@ static ToolResult HandleCreateCheat(const JsonValue& args)
   // Validate the code body before saving.
   Error error;
   if (!Cheats::ValidateCodeBody(name, type, activation, body, &error))
-    return ToolResult::Error(-3, fmt::format("Invalid cheat body: {}", error.GetDescription()));
+    return ToolResult::Error(MCP_ERR_PRECONDITION_FAILED,fmt::format("Invalid cheat body: {}", error.GetDescription()));
 
   Cheats::CodeInfo code;
   code.name = name;
@@ -4061,7 +4518,7 @@ static ToolResult HandleCreateCheat(const JsonValue& args)
   const std::string cht_path = Cheats::GetChtFilename(serial, hash, true);
 
   if (!Cheats::UpdateCodeInFile(cht_path.c_str(), name, &code, &error))
-    return ToolResult::Error(-2, fmt::format("Failed to save cheat: {}", error.GetDescription()));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to save cheat: {}", error.GetDescription()));
 
   JsonWriter w;
   w.StartObject();
@@ -4099,7 +4556,7 @@ static ToolResult HandleImportCheats(const JsonValue& args)
   Cheats::CodeInfoList imported;
   Error error;
   if (!Cheats::ImportCodesFromString(&imported, content, file_format, false, &error))
-    return ToolResult::Error(-2, fmt::format("Failed to import cheats: {}", error.GetDescription()));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to import cheats: {}", error.GetDescription()));
 
   JsonWriter w;
   w.StartObject();
@@ -4125,12 +4582,19 @@ static ToolResult HandleImportCheats(const JsonValue& args)
 static ToolResult HandleExportCheats(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("path") || !args["path"].is_string())
     return ToolResult::Error(-32602, "Missing 'path' parameter");
 
-  const std::string path = std::string(args["path"].get_string());
+  std::string path;
+  {
+    std::string err;
+    auto vp = ValidatePathArg(args, "path", &err);
+    if (!vp)
+      return ToolResult::Error(-32602, std::move(err));
+    path = std::move(*vp);
+  }
   const std::string serial = System::GetGameSerial();
   const GameHash hash = System::GetGameHash();
 
@@ -4138,7 +4602,7 @@ static ToolResult HandleExportCheats(const JsonValue& args)
 
   Error error;
   if (!Cheats::ExportCodesToFile(path, codes, &error))
-    return ToolResult::Error(-2, fmt::format("Failed to export cheats: {}", error.GetDescription()));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to export cheats: {}", error.GetDescription()));
 
   JsonWriter w;
   w.StartObject();
@@ -4192,7 +4656,7 @@ static ToolResult HandleValidateCheat(const JsonValue& args)
 static ToolResult HandleGetMemoryCardInfo(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("slot") || !args["slot"].is_number())
     return ToolResult::Error(-32602, "Missing 'slot' parameter");
@@ -4203,7 +4667,7 @@ static ToolResult HandleGetMemoryCardInfo(const JsonValue& args)
 
   const MemoryCard* mc = Pad::GetMemoryCard(slot);
   if (!mc)
-    return ToolResult::Error(-2, fmt::format("No memory card in slot {}", slot));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("No memory card in slot {}", slot));
 
   const MemoryCardImage::DataArray& data = mc->GetData();
   const bool valid = MemoryCardImage::IsValid(data);
@@ -4245,7 +4709,7 @@ static ToolResult HandleGetMemoryCardInfo(const JsonValue& args)
 static ToolResult HandleReadMemoryCardFile(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("slot") || !args["slot"].is_number())
     return ToolResult::Error(-32602, "Missing 'slot' parameter");
@@ -4258,11 +4722,11 @@ static ToolResult HandleReadMemoryCardFile(const JsonValue& args)
 
   const MemoryCard* mc = Pad::GetMemoryCard(slot);
   if (!mc)
-    return ToolResult::Error(-2, fmt::format("No memory card in slot {}", slot));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("No memory card in slot {}", slot));
 
   const MemoryCardImage::DataArray& data = mc->GetData();
   if (!MemoryCardImage::IsValid(data))
-    return ToolResult::Error(-2, "Memory card data is not valid");
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"Memory card data is not valid");
 
   const std::string filename = std::string(args["filename"].get_string());
   const auto files = MemoryCardImage::EnumerateFiles(data, false);
@@ -4278,16 +4742,16 @@ static ToolResult HandleReadMemoryCardFile(const JsonValue& args)
   }
 
   if (!target)
-    return ToolResult::Error(-2, fmt::format("File not found on memory card: {}", filename));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("File not found on memory card: {}", filename));
 
   std::vector<u8> buffer;
   Error error;
   if (!MemoryCardImage::ReadFile(data, *target, &buffer, &error))
-    return ToolResult::Error(-2, fmt::format("Failed to read file: {}", error.GetDescription()));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to read file: {}", error.GetDescription()));
 
   const std::string output_path = GetMCPTempFilePath("mcfile", "bin");
   if (!FileSystem::WriteBinaryFile(output_path.c_str(), buffer.data(), buffer.size(), &error))
-    return ToolResult::Error(-2, fmt::format("Failed to write temp file: {}", error.GetDescription()));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to write temp file: {}", error.GetDescription()));
 
   JsonWriter w;
   w.StartObject();
@@ -4304,7 +4768,7 @@ static ToolResult HandleReadMemoryCardFile(const JsonValue& args)
 static ToolResult HandleDeleteMemoryCardFile(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("slot") || !args["slot"].is_number())
     return ToolResult::Error(-32602, "Missing 'slot' parameter");
@@ -4317,11 +4781,11 @@ static ToolResult HandleDeleteMemoryCardFile(const JsonValue& args)
 
   MemoryCard* mc = Pad::GetMemoryCard(slot);
   if (!mc)
-    return ToolResult::Error(-2, fmt::format("No memory card in slot {}", slot));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("No memory card in slot {}", slot));
 
   MemoryCardImage::DataArray& data = mc->GetData();
   if (!MemoryCardImage::IsValid(data))
-    return ToolResult::Error(-2, "Memory card data is not valid");
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"Memory card data is not valid");
 
   const std::string filename = std::string(args["filename"].get_string());
   const auto files = MemoryCardImage::EnumerateFiles(data, false);
@@ -4337,16 +4801,16 @@ static ToolResult HandleDeleteMemoryCardFile(const JsonValue& args)
   }
 
   if (!target)
-    return ToolResult::Error(-2, fmt::format("File not found on memory card: {}", filename));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("File not found on memory card: {}", filename));
 
   if (!MemoryCardImage::DeleteFile(&data, *target, true))
-    return ToolResult::Error(-2, fmt::format("Failed to delete file: {}", filename));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to delete file: {}", filename));
 
   // Save the updated card back to disk.
   Error error;
   const std::string& card_path = mc->GetPath();
   if (!card_path.empty() && !MemoryCardImage::SaveToFile(data, card_path.c_str(), &error))
-    return ToolResult::Error(-2, fmt::format("Failed to save memory card: {}", error.GetDescription()));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to save memory card: {}", error.GetDescription()));
 
   JsonWriter w;
   w.StartObject();
@@ -4361,7 +4825,7 @@ static ToolResult HandleDeleteMemoryCardFile(const JsonValue& args)
 static ToolResult HandleExportMemoryCardSave(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("slot") || !args["slot"].is_number())
     return ToolResult::Error(-32602, "Missing 'slot' parameter");
@@ -4376,14 +4840,21 @@ static ToolResult HandleExportMemoryCardSave(const JsonValue& args)
 
   MemoryCard* mc = Pad::GetMemoryCard(slot);
   if (!mc)
-    return ToolResult::Error(-2, fmt::format("No memory card in slot {}", slot));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("No memory card in slot {}", slot));
 
   MemoryCardImage::DataArray& data = mc->GetData();
   if (!MemoryCardImage::IsValid(data))
-    return ToolResult::Error(-2, "Memory card data is not valid");
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"Memory card data is not valid");
 
   const std::string filename = std::string(args["filename"].get_string());
-  const std::string output_path = std::string(args["output_path"].get_string());
+  std::string output_path;
+  {
+    std::string err;
+    auto vp = ValidatePathArg(args, "output_path", &err);
+    if (!vp)
+      return ToolResult::Error(-32602, std::move(err));
+    output_path = std::move(*vp);
+  }
 
   const auto files = MemoryCardImage::EnumerateFiles(data, false);
 
@@ -4398,11 +4869,11 @@ static ToolResult HandleExportMemoryCardSave(const JsonValue& args)
   }
 
   if (!target)
-    return ToolResult::Error(-2, fmt::format("File not found on memory card: {}", filename));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("File not found on memory card: {}", filename));
 
   Error error;
   if (!MemoryCardImage::ExportSave(&data, *target, output_path.c_str(), &error))
-    return ToolResult::Error(-2, fmt::format("Failed to export save: {}", error.GetDescription()));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to export save: {}", error.GetDescription()));
 
   JsonWriter w;
   w.StartObject();
@@ -4417,7 +4888,7 @@ static ToolResult HandleExportMemoryCardSave(const JsonValue& args)
 static ToolResult HandleImportMemoryCardSave(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("slot") || !args["slot"].is_number())
     return ToolResult::Error(-32602, "Missing 'slot' parameter");
@@ -4430,25 +4901,32 @@ static ToolResult HandleImportMemoryCardSave(const JsonValue& args)
 
   MemoryCard* mc = Pad::GetMemoryCard(slot);
   if (!mc)
-    return ToolResult::Error(-2, fmt::format("No memory card in slot {}", slot));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("No memory card in slot {}", slot));
 
   MemoryCardImage::DataArray& data = mc->GetData();
   if (!MemoryCardImage::IsValid(data))
-    return ToolResult::Error(-2, "Memory card data is not valid");
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"Memory card data is not valid");
 
-  const std::string input_path = std::string(args["input_path"].get_string());
+  std::string input_path;
+  {
+    std::string err;
+    auto vp = ValidatePathArg(args, "input_path", &err);
+    if (!vp)
+      return ToolResult::Error(-32602, std::move(err));
+    input_path = std::move(*vp);
+  }
 
   if (!FileSystem::FileExists(input_path.c_str()))
-    return ToolResult::Error(-2, fmt::format("File not found: {}", input_path));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("File not found: {}", input_path));
 
   Error error;
   if (!MemoryCardImage::ImportSave(&data, input_path.c_str(), &error))
-    return ToolResult::Error(-2, fmt::format("Failed to import save: {}", error.GetDescription()));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to import save: {}", error.GetDescription()));
 
   // Save the updated card back to disk.
   const std::string& card_path = mc->GetPath();
   if (!card_path.empty() && !MemoryCardImage::SaveToFile(data, card_path.c_str(), &error))
-    return ToolResult::Error(-2, fmt::format("Failed to save memory card: {}", error.GetDescription()));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to save memory card: {}", error.GetDescription()));
 
   JsonWriter w;
   w.StartObject();
@@ -4492,7 +4970,7 @@ static ToolResult HandleGetShaderChain([[maybe_unused]] const JsonValue& args)
   auto lock = Core::GetSettingsLock();
   const SettingsInterface* si = Core::GetSettingsInterface();
   if (!si)
-    return ToolResult::Error(-1, "Settings interface not available");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"Settings interface not available");
 
   const char* section = PostProcessing::Config::DISPLAY_CHAIN_SECTION;
   const bool enabled = PostProcessing::Config::IsEnabled(*si, section);
@@ -4532,13 +5010,13 @@ static ToolResult HandleAddShader(const JsonValue& args)
   auto lock = Core::GetSettingsLock();
   SettingsInterface* si = Core::GetBaseSettingsLayer();
   if (!si)
-    return ToolResult::Error(-1, "Settings interface not available");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"Settings interface not available");
 
   const char* section = PostProcessing::Config::DISPLAY_CHAIN_SECTION;
 
   Error error;
   if (!PostProcessing::Config::AddStage(*si, section, shader_name, &error))
-    return ToolResult::Error(-2, fmt::format("Failed to add shader: {}", error.GetDescription()));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to add shader: {}", error.GetDescription()));
 
   const u32 stage_count = PostProcessing::Config::GetStageCount(*si, section);
 
@@ -4565,7 +5043,7 @@ static ToolResult HandleRemoveShader(const JsonValue& args)
   auto lock = Core::GetSettingsLock();
   SettingsInterface* si = Core::GetBaseSettingsLayer();
   if (!si)
-    return ToolResult::Error(-1, "Settings interface not available");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"Settings interface not available");
 
   const char* section = PostProcessing::Config::DISPLAY_CHAIN_SECTION;
   const u32 stage_count = PostProcessing::Config::GetStageCount(*si, section);
@@ -4600,7 +5078,7 @@ static ToolResult HandleGetShaderOptions(const JsonValue& args)
   auto lock = Core::GetSettingsLock();
   const SettingsInterface* si = Core::GetSettingsInterface();
   if (!si)
-    return ToolResult::Error(-1, "Settings interface not available");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"Settings interface not available");
 
   const char* section = PostProcessing::Config::DISPLAY_CHAIN_SECTION;
   const u32 stage_count = PostProcessing::Config::GetStageCount(*si, section);
@@ -4797,7 +5275,7 @@ static ToolResult HandleSetShaderOption(const JsonValue& args)
   auto lock = Core::GetSettingsLock();
   SettingsInterface* si = Core::GetBaseSettingsLayer();
   if (!si)
-    return ToolResult::Error(-1, "Settings interface not available");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"Settings interface not available");
 
   const char* section = PostProcessing::Config::DISPLAY_CHAIN_SECTION;
   const u32 stage_count = PostProcessing::Config::GetStageCount(*si, section);
@@ -4819,7 +5297,7 @@ static ToolResult HandleSetShaderOption(const JsonValue& args)
   }
 
   if (!target_option)
-    return ToolResult::Error(-2, fmt::format("Option not found: {}", option_name));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Option not found: {}", option_name));
 
   // Update the option value based on its type.
   const JsonValue& value_arg = args["value"];
@@ -4897,14 +5375,20 @@ static ToolResult HandleSetShaderOption(const JsonValue& args)
 static ToolResult HandleStartCapture(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   std::string path;
   if (args.contains("path") && args["path"].is_string())
-    path = std::string(args["path"].get_string());
+  {
+    std::string err;
+    auto vp = ValidateMCPPath(args["path"].get_string(), &err);
+    if (!vp)
+      return ToolResult::Error(-32602, std::move(err));
+    path = std::move(*vp);
+  }
 
   if (!System::StartMediaCapture(std::move(path)))
-    return ToolResult::Error(-3, "Failed to start media capture");
+    return ToolResult::Error(MCP_ERR_PRECONDITION_FAILED,"Failed to start media capture");
 
   JsonWriter w;
   w.StartObject();
@@ -5033,7 +5517,7 @@ static MemoryScan::Operator ParseScanOperator(std::string_view s)
 static ToolResult HandleMemoryScanStart(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   // Parse value - accept integer or hex string
   u32 value = 0;
@@ -5115,10 +5599,10 @@ static ToolResult HandleMemoryScanStart(const JsonValue& args)
 static ToolResult HandleMemoryScanRefine(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (s_memory_scan.GetResultCount() == 0)
-    return ToolResult::Error(-2, "No active scan results to refine. Run memory_scan_start first.");
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"No active scan results to refine. Run memory_scan_start first.");
 
   // Update value if provided
   if (args.contains("value"))
@@ -5261,7 +5745,7 @@ static ToolResult HandleAddMemoryWatch(const JsonValue& args)
     freeze = args["freeze"].get_bool();
 
   if (!s_memory_watch_list.AddEntry(std::move(description), address, size, is_signed, freeze))
-    return ToolResult::Error(-3, fmt::format("Failed to add watch at address {}", FormatHex32(address)));
+    return ToolResult::Error(MCP_ERR_PRECONDITION_FAILED,fmt::format("Failed to add watch at address {}", FormatHex32(address)));
 
   JsonWriter w;
   w.StartObject();
@@ -5301,7 +5785,7 @@ static ToolResult HandleRemoveMemoryWatch(const JsonValue& args)
   }
 
   if (!s_memory_watch_list.RemoveEntryByAddress(address))
-    return ToolResult::Error(-3, fmt::format("No watch found at address {}", FormatHex32(address)));
+    return ToolResult::Error(MCP_ERR_PRECONDITION_FAILED,fmt::format("No watch found at address {}", FormatHex32(address)));
 
   JsonWriter w;
   w.StartObject();
@@ -5390,7 +5874,7 @@ static ToolResult HandleListHotkeys(const JsonValue& args)
 static ToolResult HandleTriggerHotkey(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("name") || !args["name"].is_string())
     return ToolResult::Error(-32602, "Missing 'name' parameter");
@@ -5403,7 +5887,7 @@ static ToolResult HandleTriggerHotkey(const JsonValue& args)
     if (StringUtil::EqualNoCase(hk.name, name))
     {
       if (!hk.handler)
-        return ToolResult::Error(-3, fmt::format("Hotkey '{}' has no handler", name));
+        return ToolResult::Error(MCP_ERR_PRECONDITION_FAILED,fmt::format("Hotkey '{}' has no handler", name));
 
       // Simulate press then release
       hk.handler(1);
@@ -5450,7 +5934,7 @@ static ToolResult HandleGetAchievementsDetails([[maybe_unused]] const JsonValue&
     w.KeyString("username", Achievements::GetLoggedInUserName());
 
     auto lock = Achievements::GetLock();
-    w.KeyString("user_badge_path", Achievements::GetLoggedInUserBadgePath());
+    w.KeyString("user_badge_path", Achievements::GetLoggedInUserIconURL());
     w.KeyString("points_summary", std::string(Achievements::GetLoggedInUserPointsSummary()));
   }
 
@@ -5461,9 +5945,9 @@ static ToolResult HandleGetAchievementsDetails([[maybe_unused]] const JsonValue&
   {
     auto lock = Achievements::GetLock();
 
-    w.KeyString("game_title", Achievements::GetGameTitle());
-    w.KeyString("game_path", Achievements::GetGamePath());
-    w.KeyString("game_icon_url", Achievements::GetGameIconURL());
+    w.KeyString("game_title", Achievements::GetCurrentGameTitle());
+    w.KeyString("game_path", Achievements::GetCurrentGamePath());
+    w.KeyString("game_icon_url", Achievements::GetCurrentGameBadgeURL());
     w.KeyBool("has_achievements", Achievements::HasAchievements());
     w.KeyBool("has_leaderboards", Achievements::HasLeaderboards());
     w.KeyBool("has_rich_presence", Achievements::HasRichPresence());
@@ -5508,14 +5992,14 @@ static const char* TrackModeToString(CDImage::TrackMode mode)
 static ToolResult HandleGetDiscInfo([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!CDROM::HasMedia())
-    return ToolResult::Error(-2, "No disc inserted");
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"No disc inserted");
 
   const CDImage* media = CDROM::GetMedia();
   if (!media)
-    return ToolResult::Error(-2, "No disc media available");
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"No disc media available");
 
   JsonWriter w;
   w.StartObject();
@@ -5561,11 +6045,11 @@ static ToolResult HandleGetDiscInfo([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleListDiscFiles(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   const CDImage* media = CDROM::GetMedia();
   if (!media)
-    return ToolResult::Error(-1, "No disc loaded");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"No disc loaded");
 
   const std::string_view path =
     (args.contains("path") && args["path"].is_string()) ? args["path"].get_string() : "/";
@@ -5575,7 +6059,7 @@ static ToolResult HandleListDiscFiles(const JsonValue& args)
   IsoReader iso;
   Error error;
   if (!iso.Open(const_cast<CDImage*>(media), 1, &error))
-    return ToolResult::Error(-2, fmt::format("Failed to open ISO filesystem: {}", error.GetDescription()));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to open ISO filesystem: {}", error.GetDescription()));
 
   JsonWriter w;
   w.StartObject();
@@ -5624,11 +6108,11 @@ static ToolResult HandleListDiscFiles(const JsonValue& args)
 static ToolResult HandleReadDiscFile(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   const CDImage* media = CDROM::GetMedia();
   if (!media)
-    return ToolResult::Error(-1, "No disc loaded");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"No disc loaded");
 
   if (!args.contains("path") || !args["path"].is_string())
     return ToolResult::Error(-32602, "Missing required 'path' parameter");
@@ -5638,11 +6122,11 @@ static ToolResult HandleReadDiscFile(const JsonValue& args)
   IsoReader iso;
   Error error;
   if (!iso.Open(const_cast<CDImage*>(media), 1, &error))
-    return ToolResult::Error(-2, fmt::format("Failed to open ISO filesystem: {}", error.GetDescription()));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to open ISO filesystem: {}", error.GetDescription()));
 
   std::vector<u8> data;
   if (!iso.ReadFile(disc_path, &data, IsoReader::ReadMode::Data, &error))
-    return ToolResult::Error(-2, fmt::format("Failed to read '{}': {}", disc_path, error.GetDescription()));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to read '{}': {}", disc_path, error.GetDescription()));
 
   static constexpr size_t MAX_FILE_SIZE = 700u * 1024u * 1024u;
   if (data.size() > MAX_FILE_SIZE)
@@ -5651,7 +6135,7 @@ static ToolResult HandleReadDiscFile(const JsonValue& args)
 
   const std::string output_path = GetMCPTempFilePath("disc_file", "bin");
   if (!FileSystem::WriteBinaryFile(output_path.c_str(), data.data(), data.size(), &error))
-    return ToolResult::Error(-2, fmt::format("Failed to write temp file: {}", error.GetDescription()));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to write temp file: {}", error.GetDescription()));
 
   JsonWriter w;
   w.StartObject();
@@ -5665,11 +6149,11 @@ static ToolResult HandleReadDiscFile(const JsonValue& args)
 static ToolResult HandleReadDiscSectors(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   const CDImage* media = CDROM::GetMedia();
   if (!media)
-    return ToolResult::Error(-1, "No disc loaded");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"No disc loaded");
 
   if (!args.contains("lba") || !args["lba"].is_number_integer())
     return ToolResult::Error(-32602, "Missing required 'lba' parameter");
@@ -5687,7 +6171,7 @@ static ToolResult HandleReadDiscSectors(const JsonValue& args)
   CDImage* mutable_media = const_cast<CDImage*>(media);
 
   if (!mutable_media->Seek(lba))
-    return ToolResult::Error(-2, fmt::format("Failed to seek to LBA {}", lba));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to seek to LBA {}", lba));
 
   const u32 sector_size = CDImage::RAW_SECTOR_SIZE;
   const u32 total_bytes = sector_size * count;
@@ -5696,13 +6180,13 @@ static ToolResult HandleReadDiscSectors(const JsonValue& args)
   for (u32 i = 0; i < count; i++)
   {
     if (!mutable_media->ReadRawSector(buffer.data() + i * sector_size, nullptr))
-      return ToolResult::Error(-2, fmt::format("Failed to read sector at LBA {}", lba + i));
+      return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to read sector at LBA {}", lba + i));
   }
 
   const std::string output_path = GetMCPTempFilePath("disc_sectors", "bin");
   Error error;
   if (!FileSystem::WriteBinaryFile(output_path.c_str(), buffer.data(), buffer.size(), &error))
-    return ToolResult::Error(-2, fmt::format("Failed to write temp file: {}", error.GetDescription()));
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to write temp file: {}", error.GetDescription()));
 
   JsonWriter w;
   w.StartObject();
@@ -5718,7 +6202,7 @@ static ToolResult HandleReadDiscSectors(const JsonValue& args)
 static ToolResult HandleReadVramRegion(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("x") || !args.contains("y") || !args.contains("width") || !args.contains("height"))
     return ToolResult::Error(-32602, "Missing required parameters (x, y, width, height)");
@@ -5742,6 +6226,9 @@ static ToolResult HandleReadVramRegion(const JsonValue& args)
   if (args.contains("format") && args["format"].is_string())
     format = std::string(args["format"].get_string());
 
+  // Sync GPU-side VRAM into the CPU mirror for the requested region.
+  SyncVRAMReadback(static_cast<u16>(x), static_cast<u16>(y), static_cast<u16>(width), static_cast<u16>(height));
+
   Error error;
 
   if (format == "raw")
@@ -5754,7 +6241,7 @@ static ToolResult HandleReadVramRegion(const JsonValue& args)
 
     const std::string output_path = GetMCPTempFilePath("vram_region", "bin");
     if (!FileSystem::WriteBinaryFile(output_path.c_str(), raw_data.data(), raw_data.size(), &error))
-      return ToolResult::Error(-2, fmt::format("Failed to write temp file: {}", error.GetDescription()));
+      return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to write temp file: {}", error.GetDescription()));
 
     JsonWriter w;
     w.StartObject();
@@ -5791,7 +6278,7 @@ static ToolResult HandleReadVramRegion(const JsonValue& args)
 
     const std::string output_path = GetMCPTempFilePath("vram_region", "png");
     if (!img.SaveToFile(output_path.c_str(), Image::DEFAULT_SAVE_QUALITY, &error))
-      return ToolResult::Error(-2, fmt::format("Failed to save PNG: {}", error.GetDescription()));
+      return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to save PNG: {}", error.GetDescription()));
 
     JsonWriter w;
     w.StartObject();
@@ -5813,7 +6300,7 @@ static ToolResult HandleReadVramRegion(const JsonValue& args)
 static ToolResult HandleWriteVramRegion(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("x") || !args.contains("y") || !args.contains("width") || !args.contains("height"))
     return ToolResult::Error(-32602, "Missing required parameters (x, y, width, height)");
@@ -5836,7 +6323,14 @@ static ToolResult HandleWriteVramRegion(const JsonValue& args)
                              fmt::format("Region ({},{})+({}x{}) exceeds VRAM bounds ({}x{})", x, y, width, height,
                                          VW, VH));
 
-  const std::string input_path = std::string(args["input_path"].get_string());
+  std::string input_path;
+  {
+    std::string err;
+    auto vp = ValidatePathArg(args, "input_path", &err);
+    if (!vp)
+      return ToolResult::Error(-32602, std::move(err));
+    input_path = std::move(*vp);
+  }
 
   std::string format = "raw";
   if (args.contains("format") && args["format"].is_string())
@@ -5854,12 +6348,16 @@ static ToolResult HandleWriteVramRegion(const JsonValue& args)
   const u32 expected_size = width * height * sizeof(u16);
   if (file_data->size() != expected_size)
   {
-    return ToolResult::Error(-3, fmt::format("File size mismatch: expected {} bytes ({}x{}x2), got {}", expected_size,
+    return ToolResult::Error(MCP_ERR_PRECONDITION_FAILED,fmt::format("File size mismatch: expected {} bytes ({}x{}x2), got {}", expected_size,
                                              width, height, file_data->size()));
   }
 
-  // Write raw u16 data row-by-row into g_vram.
+  // Push the new data to the GPU backend (updates GPU-side VRAM on hardware backends).
   const u16* src = reinterpret_cast<const u16*>(file_data->data());
+  PushVRAMUpdate(static_cast<u16>(x), static_cast<u16>(y), static_cast<u16>(width), static_cast<u16>(height), src,
+                 false, false);
+
+  // Mirror into CPU-side g_vram so subsequent CPU-side reads (without ReadVRAM) see the same data.
   for (u32 row = 0; row < height; row++)
     std::memcpy(&g_vram[(y + row) * VW + x], src + row * width, width * sizeof(u16));
 
@@ -5877,7 +6375,7 @@ static ToolResult HandleWriteVramRegion(const JsonValue& args)
 static ToolResult HandleSnapshotMemory(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   u32 virt_addr = 0x80000000u;
   if (args.contains("address"))
@@ -5891,7 +6389,7 @@ static ToolResult HandleSnapshotMemory(const JsonValue& args)
   const u32 phys_addr = virt_addr & 0x1FFFFFFFu;
 
   if (phys_addr >= Bus::g_ram_size)
-    return ToolResult::Error(-3, fmt::format("Address {} is out of RAM range (RAM size: {} bytes)",
+    return ToolResult::Error(MCP_ERR_PRECONDITION_FAILED,fmt::format("Address {} is out of RAM range (RAM size: {} bytes)",
                                              FormatHex32(virt_addr), Bus::g_ram_size));
 
   u32 snap_size = Bus::g_ram_size - phys_addr;
@@ -5901,7 +6399,7 @@ static ToolResult HandleSnapshotMemory(const JsonValue& args)
     if (requested == 0)
       return ToolResult::Error(-32602, "'size' must be greater than 0");
     if (phys_addr + requested > Bus::g_ram_size)
-      return ToolResult::Error(-3, fmt::format("Requested size {} would exceed RAM bounds", requested));
+      return ToolResult::Error(MCP_ERR_PRECONDITION_FAILED,fmt::format("Requested size {} would exceed RAM bounds", requested));
     snap_size = requested;
   }
 
@@ -5922,13 +6420,13 @@ static ToolResult HandleSnapshotMemory(const JsonValue& args)
 static ToolResult HandleDiffMemory(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (s_memory_snapshot.empty())
-    return ToolResult::Error(-3, "No memory snapshot available — call snapshot_memory first");
+    return ToolResult::Error(MCP_ERR_PRECONDITION_FAILED,"No memory snapshot available — call snapshot_memory first");
 
   if (s_snapshot_base_address + s_snapshot_size > Bus::g_ram_size)
-    return ToolResult::Error(-3, "Snapshot range is no longer valid (RAM size changed?)");
+    return ToolResult::Error(MCP_ERR_PRECONDITION_FAILED,"Snapshot range is no longer valid (RAM size changed?)");
 
   static constexpr u32 MAX_CHANGES = 500;
 
@@ -5979,7 +6477,7 @@ static ToolResult HandleDiffMemory(const JsonValue& args)
 static ToolResult HandleFindFreeRam(const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   u32 min_size = 256;
   if (args.contains("min_size") && args["min_size"].is_number_integer())
@@ -6248,8 +6746,13 @@ static ToolResult HandleDiscControlUnified(const JsonValue& args)
 static ToolResult HandleWaitForPause([[maybe_unused]] const JsonValue& args)
 {
   if (!System::IsValid())
-    return ToolResult::Error(-1, "System not running");
+    return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
+  // NOTE on threading: this handler runs on the core thread between emulation chunks.
+  // A server-side blocking wait would freeze emulation, so the breakpoint could never
+  // fire — deadlock by design. Polling is the only viable pattern. The hint below tells
+  // the LLM how long to wait before re-polling. Clients with SSE connected can also
+  // subscribe to "notifications/resources/updated" for "emulator://status".
   JsonWriter w;
   w.StartObject();
   if (System::IsPaused())
@@ -6260,7 +6763,10 @@ static ToolResult HandleWaitForPause([[maybe_unused]] const JsonValue& args)
   else
   {
     w.KeyString("status", "running");
-    w.KeyString("message", "System is still running. Poll again to check if it has paused.");
+    w.KeyUint("poll_after_ms", 50);
+    w.KeyString("message", "System is still running. Re-poll after poll_after_ms, or "
+                           "subscribe to SSE notifications/resources/updated for "
+                           "emulator://status to be notified asynchronously.");
   }
   w.EndObject();
   return ToolResult{w.TakeOutput()};
@@ -6731,7 +7237,7 @@ void MCPServer::ClientSocket::OnRead()
                                (line_end != std::string::npos ? line_end : headers_len) - auth_pos);
         while (!value.empty() && value.front() == ' ')
           value.remove_prefix(1);
-        m_last_auth_ok = (value == expected);
+        m_last_auth_ok = ConstantTimeEqual(value, expected);
       }
     }
     else
@@ -6876,8 +7382,34 @@ void MCPServer::ClientSocket::ProcessHttpRequest(const std::string& method, cons
     const std::string priming = "id: 0\ndata: \n\n";
     Write(priming.data(), priming.size());
 
+    // Replay any buffered events the client missed since their last seen event id.
     if (!m_last_event_id_header.empty())
-      DEV_LOG("Client reconnected SSE with Last-Event-ID: {}", m_last_event_id_header);
+    {
+      u64 last_id = 0;
+      const auto parse_result = std::from_chars(
+        m_last_event_id_header.data(),
+        m_last_event_id_header.data() + m_last_event_id_header.size(), last_id);
+      if (parse_result.ec == std::errc{})
+      {
+        const int replayed = ReplaySSEEventsFrom(last_id);
+        if (replayed < 0)
+        {
+          WARNING_LOG("SSE reconnect from {} requested Last-Event-ID {} but buffer rolled past it; "
+                      "client missed events.",
+                      GetRemoteAddress().ToString(), last_id);
+        }
+        else if (replayed > 0)
+        {
+          INFO_LOG("Replayed {} SSE event(s) to reconnecting client (Last-Event-ID={}).",
+                   replayed, last_id);
+        }
+      }
+      else
+      {
+        WARNING_LOG("SSE reconnect from {} sent malformed Last-Event-ID '{}'.",
+                    GetRemoteAddress().ToString(), m_last_event_id_header);
+      }
+    }
 
     // Connection stays open — server sends events via BroadcastSSEEvent / OnSystemPaused / etc.
   }
@@ -6899,9 +7431,10 @@ void MCPServer::ClientSocket::ProcessHttpRequest(const std::string& method, cons
     INFO_LOG("Session {} terminated by DELETE from {}", s_mcp_session_id,
              GetRemoteAddress().ToString());
 
-    // Terminate session: clear session ID and disconnect all SSE clients.
+    // Terminate session: clear session ID, reset per-session state, disconnect SSE clients.
     s_mcp_session_id.clear();
     s_negotiated_protocol_version.clear();
+    ResetSessionState();
     for (auto& client : s_sse_clients)
       client->m_is_sse = false;
     s_sse_clients.clear();
@@ -7008,6 +7541,10 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
                     client_version, SUPPORTED_VERSIONS[0]);
     }
 
+    // Reset state from any prior session so a new client starts clean (no inherited
+    // memory scan, snapshot, input sequence, subscriptions, or log streaming).
+    ResetSessionState();
+
     // Generate a new crypto-secure session ID.
     s_mcp_session_id = GenerateSessionId();
     s_negotiated_protocol_version = negotiated_version;
@@ -7047,19 +7584,19 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
 {"name":"write_register","description":"Write a value to a CPU register by name. Returns: {register, value} confirming the written value.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Register name (e.g. 'v0', 'sp', 'pc', 'COP0_SR')"},"value":{"description":"Value to write (integer or hex string like '0x80010000')"}},"required":["name","value"]},"title":"Write Register","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}},
 {"name":"disassemble","description":"Disassemble MIPS instructions at a given address. Returns: JSON array of {address, bytes, instruction, comment} objects, one per instruction.","inputSchema":{"type":"object","properties":{"address":{"description":"Start address (integer or hex string)"},"count":{"type":"integer","default":20,"description":"Number of instructions to disassemble"}},"required":["address"]},"title":"Disassemble","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
 {"name":"step_into","description":"Execute a single CPU instruction and return register state. Returns: GPR register snapshot (same format as read_registers with group=gpr).","inputSchema":{"type":"object","properties":{}},"title":"Step Into","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
-{"name":"step_over","description":"Step over the current instruction. WARNING: This RESUMES execution and returns immediately. The system will pause when the next instruction is reached or after the call returns. Unlike step_into (synchronous), step_over is asynchronous. Poll get_status to detect when paused. Returns: {status} confirmation message.","inputSchema":{"type":"object","properties":{}},"title":"Step Over","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
-{"name":"step_out","description":"Run until the current function returns. WARNING: This RESUMES execution and returns immediately (asynchronous). Poll get_status to detect when the system pauses. Returns: {status} confirmation message.","inputSchema":{"type":"object","properties":{"max_instructions":{"type":"integer","default":10000,"description":"Maximum instructions to search for return"}}},"title":"Step Out","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
+{"name":"step_over","description":"Step over the current instruction. If PC is on a call (JAL/JALR), this is ASYNC: returns {status:'initiated', kind:'step_over'} and resumes the CPU; completion is signalled by an SSE 'system_paused' event with reason='step_over' or visible by polling get_status. If PC is NOT on a call, falls back to a single-step (executed synchronously, like step_into) and returns {status:'stepped', fell_back_to_step_into:true} — no resume, no SSE event.","inputSchema":{"type":"object","properties":{}},"title":"Step Over","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
+{"name":"step_out","description":"Run until the current function returns. ASYNC on success: returns {status:'initiated', kind:'step_out', max_instructions} and resumes the CPU; completion is signalled by an SSE 'system_paused' event with reason='step_out' or visible by polling get_status. Errors with PRECONDITION_FAILED (and does NOT resume) if no return instruction is found within max_instructions of the current PC.","inputSchema":{"type":"object","properties":{"max_instructions":{"type":"integer","default":10000,"description":"Maximum instructions to search for return"}}},"title":"Step Out","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
 {"name":"pause","description":"Pause the running system","inputSchema":{"type":"object","properties":{}},"title":"Pause","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
 {"name":"continue","description":"Resume execution of a paused system. The system runs until a breakpoint/watchpoint is hit or pause is called. Poll get_status to detect when execution stops.","inputSchema":{"type":"object","properties":{}},"title":"Continue","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
-{"name":"read_memory","description":"Read bytes from memory at a given address (max 2MB). If 'path' is provided, writes raw bytes to that file and returns {address, size, output_path}. Otherwise returns {address, size, data} where data is hex or base64 encoded.","inputSchema":{"type":"object","properties":{"address":{"description":"Start address (integer or hex string)"},"size":{"type":"integer","description":"Number of bytes to read (max 2097152)"},"format":{"type":"string","enum":["hex","base64"],"default":"hex","description":"Output format for inline data (ignored when path is set)"},"path":{"type":"string","description":"Optional file path to write raw bytes to (for large reads)"}},"required":["address","size"]},"title":"Read Memory","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
+{"name":"read_memory","description":"Read bytes from memory at a given address (max 2MB). If 'path' is provided, writes raw bytes to that file and returns {address, size, output_path}. Otherwise returns {address, size, data} where data is hex or base64 encoded.","inputSchema":{"type":"object","properties":{"address":{"description":"Start address (integer or hex string)"},"size":{"type":"integer","description":"Number of bytes to read (max 2097152)"},"format":{"type":"string","enum":["hex","base64"],"default":"hex","description":"Output format for inline data (ignored when path is set)"},"path":{"type":"string","description":"Optional file path to write raw bytes to (for large reads)"}},"required":["address","size"]},"title":"Read Memory","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
 {"name":"write_memory","description":"Write bytes to memory at a given address (max 2MB). Provide either 'data' (hex/base64 inline) or 'path' (read from file). Returns: {address, bytes_written}.","inputSchema":{"type":"object","properties":{"address":{"description":"Start address (integer or hex string)"},"data":{"type":"string","description":"Data to write (hex or base64 encoded string)"},"format":{"type":"string","enum":["hex","base64"],"default":"hex","description":"Encoding format of the data parameter"},"path":{"type":"string","description":"File path to read raw bytes from (alternative to data, for large writes)"}},"required":["address"]},"title":"Write Memory","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}},
 {"name":"search_memory","description":"Search PS1 memory for a byte pattern with optional wildcard mask. Returns all matching addresses in one call. For iterative value hunting (cheat search) use memory_scan_start instead. Returns: {matches: [\"0x80012345\", ...]} array of hex address strings (max 100).","inputSchema":{"type":"object","properties":{"start":{"description":"Start address (integer or hex string, default 0)"},"pattern":{"type":"string","description":"Hex string pattern to search for (e.g. 'FF0042')"},"mask":{"type":"string","description":"Hex string mask (FF=must match, 00=wildcard). Same length as pattern. Default: all FF"}},"required":["pattern"]},"title":"Search Memory","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
-{"name":"dump_ram","description":"Dump the entire RAM (2MB) to a file. If path is omitted, saves to a temp file. Returns: {path, size}.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to save to (optional, auto-generated if omitted)"}}},"title":"Dump RAM","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
+{"name":"dump_ram","description":"Dump the entire RAM (2MB) to a file. If path is omitted, saves to a temp file. Returns: {path, size}.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to save to (optional, auto-generated if omitted)"}}},"title":"Dump RAM","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
 {"name":"get_gpu_state","description":"Get GPU state. aspect='registers' (default): GPUSTAT, display resolution, interlace mode. aspect='draw': texture page, semi-transparency, dithering, draw area. aspect='stats': rendered resolution, refresh frequencies, aspect ratio. aspect='crtc': beam position, horizontal/vertical timing, display rects. aspect='all': everything. Returns: JSON object with fields specific to the requested aspect.","inputSchema":{"type":"object","properties":{"aspect":{"type":"string","enum":["registers","draw","stats","crtc","all"],"default":"registers","description":"Which aspect of GPU state to return"}}},"title":"Get GPU State","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
 {"name":"get_spu_state","description":"Get SPU state. detail='basic' (default): control/status registers, main volume, CD volume. detail='voices': per-voice state (volume, pitch, ADSR, addresses) for all 24 voices (or specific voice). detail='reverb': reverb configuration (all 32 reverb registers, work area, volumes). Returns: JSON object with fields specific to the requested detail level.","inputSchema":{"type":"object","properties":{"detail":{"type":"string","enum":["basic","voices","reverb"],"default":"basic","description":"Detail level"},"voice":{"type":"integer","minimum":0,"maximum":23,"description":"Optional voice index (0-23) for voices detail"}}},"title":"Get SPU State","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
 {"name":"get_cdrom_state","description":"Get CD-ROM state. detail='basic' (default): disc inserted, region, current track, seek position, drive state. detail='extended': adds precise LBA position, MSF time, full track layout, sub-Q channel data, total disc size. Returns: JSON object with has_media, disc_region, current_lba, track_count, and more depending on detail level.","inputSchema":{"type":"object","properties":{"detail":{"type":"string","enum":["basic","extended"],"default":"basic","description":"Detail level"}}},"title":"Get CDROM State","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
-{"name":"dump_vram","description":"Dump the entire 1024x512 16-bit VRAM to a file (PNG or raw binary). If path is omitted, saves to a temp file. Returns: {path, format, size}.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to save to (optional, auto-generated if omitted)"},"format":{"type":"string","enum":["png","bin"],"default":"png","description":"Output format: 'png' (RGBA8 PNG image) or 'bin' (raw 16-bit VRAM data)"}}},"title":"Dump VRAM","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
-{"name":"dump_spu_ram","description":"Dump the entire 512KB SPU RAM to a file. If path is omitted, saves to a temp file. Returns: {path, size}.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to save to (optional, auto-generated if omitted)"}}},"title":"Dump SPU RAM","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
+{"name":"dump_vram","description":"Dump the entire 1024x512 16-bit VRAM to a file (PNG or raw binary). If path is omitted, saves to a temp file. Returns: {path, format, size}.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to save to (optional, auto-generated if omitted)"},"format":{"type":"string","enum":["png","bin"],"default":"png","description":"Output format: 'png' (RGBA8 PNG image) or 'bin' (raw 16-bit VRAM data)"}}},"title":"Dump VRAM","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
+{"name":"dump_spu_ram","description":"Dump the entire 512KB SPU RAM to a file. If path is omitted, saves to a temp file. Returns: {path, size}.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to save to (optional, auto-generated if omitted)"}}},"title":"Dump SPU RAM","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
 {"name":"get_status","description":"Get system status. detail='basic' (default): state, title, serial, frame number, tick counter (works when no game loaded). detail='full': adds game_path, region, speed, FPS, taints, latency, session time, boot mode. Returns: JSON object with state ('running'/'paused'/'shutdown'), game_serial, game_title, frame_number, and more depending on detail level.","inputSchema":{"type":"object","properties":{"detail":{"type":"string","enum":["basic","full"],"default":"basic","description":"Detail level"}}},"title":"Get Status","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
 {"name":"reset","description":"Reset the running system","inputSchema":{"type":"object","properties":{}},"title":"Reset","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}},
 {"name":"save_state","description":"Save system state to a numbered slot. Returns: {status: 'saved', slot}.","inputSchema":{"type":"object","properties":{"slot":{"type":"integer","minimum":1,"maximum":10,"description":"Save state slot number (1-10)"}},"required":["slot"]},"title":"Save State","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
@@ -7072,21 +7609,23 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
 {"name":"list_controllers","description":"List all configured controllers with their types and available bindings. Returns: {controllers: [{slot, type, display_name, bindings: [{name, display_name, type, bind_index}]}]}.","inputSchema":{"type":"object","properties":{}},"title":"List Controllers","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
 {"name":"input_sequence","description":"Execute a timed sequence of button inputs across multiple frames. Returns: {sequence_id, total_frames}.","inputSchema":{"type":"object","properties":{"slot":{"type":"integer","default":0,"description":"Controller slot (0-7)"},"sequence":{"type":"array","description":"Array of input steps","items":{"type":"object","properties":{"buttons":{"type":"array","items":{"type":"string"},"description":"Buttons to press for this step"},"duration_frames":{"type":"integer","description":"How many frames to hold these buttons"}}}}},"required":["sequence"]},"title":"Input Sequence","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
 {"name":"get_settings","description":"Get current emulator settings (GPU renderer, resolution scale, CPU overclock, etc.). Returns: JSON object grouped by section {GPU: {...}, Display: {...}, CPU: {...}, Emulation: {...}, Audio: {...}, CDROM: {...}}.","inputSchema":{"type":"object","properties":{}},"title":"Get Settings","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
+)json" R"json(
 {"name":"set_setting","description":"Set an emulator setting. Supported: GPU/ResolutionScale (1-16), GPU/PGXP (bool), CPU/Overclock (bool), CPU/OverclockNumerator (uint), CPU/OverclockDenominator (uint), Audio/OutputVolume (0-100), Audio/Muted (bool), CDROM/ReadSpeedup (1-99), CDROM/SeekSpeedup (1-99). Returns: {setting, applied: bool}.","inputSchema":{"type":"object","properties":{"section":{"type":"string","enum":["GPU","CPU","Audio","CDROM"],"description":"Settings section"},"key":{"type":"string","description":"Setting key name"},"value":{"description":"Value to set (string, number, or boolean)"}},"required":["section","key","value"]},"title":"Set Setting","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
 {"name":"set_speed","description":"Control emulation speed, fast-forward, turbo, or rewind. Returns: {target_speed, fast_forward, turbo, rewind} reflecting the current speed state after changes.","inputSchema":{"type":"object","properties":{"speed":{"type":"number","description":"Speed multiplier (e.g. 1.0 = normal, 2.0 = double)"},"fast_forward":{"type":"boolean","description":"Enable/disable fast-forward"},"turbo":{"type":"boolean","description":"Enable/disable turbo mode"},"rewind":{"type":"boolean","description":"Enable/disable rewind"}}},"title":"Set Speed","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
-{"name":"take_screenshot","description":"Take a screenshot and save it to disk. Returns: {status: 'screenshot_saved', path?}.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to save screenshot (optional, uses default if not specified)"}}},"title":"Take Screenshot","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
+{"name":"take_screenshot","description":"Take a screenshot and save it to disk. Returns: {status: 'screenshot_saved', path?}.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to save screenshot (optional, uses default if not specified)"}}},"title":"Take Screenshot","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
 {"name":"list_cheats","description":"List available cheats and patches for the current game. Returns: {codes: [{name, author, description, type, activation, from_database}], count}.","inputSchema":{"type":"object","properties":{"type":{"type":"string","enum":["cheats","patches","all"],"default":"all","description":"Filter by type: cheats, patches, or all"}}},"title":"List Cheats","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
 {"name":"toggle_cheat","description":"Toggle a cheat code on or off by name. Returns: {name, enabled, cheats_master_enabled}.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Name of the cheat to toggle"},"enabled":{"type":"boolean","description":"Force enabled (true) or disabled (false). Omit to toggle."}},"required":["name"]},"title":"Toggle Cheat","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
 {"name":"apply_cheat","description":"Apply a cheat code to memory once (one-shot write). Unlike toggle_cheat which enables persistent per-frame codes, this writes the cheat values to RAM immediately and does not persist. Returns: {status: 'applied', name}.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Name of the cheat to apply"}},"required":["name"]},"title":"Apply Cheat","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
 {"name":"get_cheat_status","description":"Get the status of all active cheats. Returns: {cheats_enabled, active_cheat_count, active_patch_count, widescreen_patch_active}.","inputSchema":{"type":"object","properties":{}},"title":"Get Cheat Status","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
 {"name":"list_save_states","description":"List available save states for the current or specified game. Returns: {serial, count, states: [{path, slot, global, timestamp}]}.","inputSchema":{"type":"object","properties":{"serial":{"type":"string","description":"Game serial to list save states for (optional, uses current game)"}}},"title":"List Save States","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
 {"name":"swap_memory_cards","description":"Swap memory cards between slot 1 and slot 2","inputSchema":{"type":"object","properties":{}},"title":"Swap Memory Cards","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
-{"name":"boot_game","description":"Boot a game from a disc image or executable path. Returns: {status: 'booted', path}.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Path to the game disc image or executable"},"fast_boot":{"type":"boolean","description":"Skip BIOS intro (fast boot)"},"start_paused":{"type":"boolean","description":"Start the system in paused state"},"force_software":{"type":"boolean","description":"Force software renderer"}},"required":["path"]},"title":"Boot Game","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
-{"name":"shutdown_system","description":"Shut down the running system. Returns: {status: 'shutdown', save_resume_state}.","inputSchema":{"type":"object","properties":{"save_resume_state":{"type":"boolean","default":true,"description":"Save a resume state before shutting down"}}},"title":"Shutdown System","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}},
+{"name":"boot_game","description":"Boot a game from a disc image or executable path. Synchronous: BIOS load, region detection and disc mount finish before this returns; the CPU then runs (or stays paused if start_paused=true). Returns: {status:'booted', path}. Errors if a system is already running — call shutdown_system first.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Path to the game disc image or executable"},"fast_boot":{"type":"boolean","description":"Skip BIOS intro (fast boot)"},"start_paused":{"type":"boolean","description":"Start the system in paused state"},"force_software":{"type":"boolean","description":"Force software renderer"}},"required":["path"]},"title":"Boot Game","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
+{"name":"shutdown_system","description":"Shut down the running system. Synchronous: emulation stops and (if save_resume_state=true) a resume state is written to disk before this returns. SSE clients also receive a 'system_shutdown' event. Returns: {status:'shutdown', save_resume_state}.","inputSchema":{"type":"object","properties":{"save_resume_state":{"type":"boolean","default":true,"description":"Save a resume state before shutting down"}}},"title":"Shutdown System","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}},
 {"name":"get_cop0_state","description":"Get COP0 (System Control Coprocessor) registers with decoded bitfields: Status Register, CAUSE, EPC, DCIC breakpoint control, etc. Essential for interrupt and exception analysis. Returns: {sr: {bits, IEc, KUc, ...}, cause: {bits, Excode, Excode_name, ...}, dcic: {bits, ...}, EPC, BadVaddr, BPC, BDA, BPCM, BDAM, TAR, PRID}.","inputSchema":{"type":"object","properties":{}},"title":"Get COP0 State","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
 {"name":"get_cpu_execution_state","description":"Get CPU pipeline/execution state (PC, NPC, branch delay slot, load delays, ticks, cache control). Returns: {pc, npc, current_instruction_pc, in_branch_delay_slot, pending_ticks, downcount, load_delay_reg/value, cache_control, ...}.","inputSchema":{"type":"object","properties":{}},"title":"Get CPU Execution State","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
 {"name":"get_gte_registers","description":"Read all 64 GTE (Geometry Transform Engine) registers: 32 data registers (vectors, matrices, color FIFO) + 32 control registers (rotation matrix, translation, projection). Used for 3D math on PS1. Returns: {data_registers: {name: hex, ...}, control_registers: {name: hex, ...}}.","inputSchema":{"type":"object","properties":{}},"title":"Get GTE Registers","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
 {"name":"set_gte_register","description":"Write a value to a GTE register by index (0-63). Returns: {success, index, value}.","inputSchema":{"type":"object","properties":{"index":{"type":"integer","minimum":0,"maximum":63,"description":"GTE register index (0-31 data, 32-63 control)"},"value":{"description":"Value to write (integer or hex string)"}},"required":["index","value"]},"title":"Set GTE Register","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}},
+)json" R"json(
 {"name":"get_memory_map","description":"Get PS1 memory region layout (RAM, BIOS, EXP1, scratchpad, hardware registers). Returns: {ram_size, memory_regions: [{name, start, end, size, writable}], hardware_registers: [{name, start, size}]}.","inputSchema":{"type":"object","properties":{}},"title":"Get Memory Map","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
 {"name":"inject_executable","description":"Load a PS1 executable (PS-EXE) into emulated RAM at the address specified in its header. Optionally sets PC to the entry point to begin execution. Returns: {success, path, size, set_pc}.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Path to the PS-EXE file"},"set_pc":{"type":"boolean","default":true,"description":"Set PC to the executable entry point"}},"required":["path"]},"title":"Inject Executable","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}},
 {"name":"get_achievements_state","description":"Get RetroAchievements state. detail='basic' (default): login status, current game ID, hardcore mode, rich presence. detail='full': adds game metadata, achievement list, detailed login info. Returns: {active, logged_in, hardcore_mode, has_active_game, username?, game_id?, game_title?, rich_presence?, ...}.","inputSchema":{"type":"object","properties":{"detail":{"type":"string","enum":["basic","full"],"default":"basic","description":"Detail level"}}},"title":"Get Achievements State","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
@@ -7104,12 +7643,13 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
 {"name":"get_cheat_details","description":"Get full details of a cheat code by name (body, author, options). Returns: {name, author, description, body, type, activation, from_database, options?: [{name, value}]}.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Cheat code name"}},"required":["name"]},"title":"Get Cheat Details","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
 {"name":"create_cheat","description":"Create a new cheat code for the current game. Returns: {status: 'created', name, path, type, activation}.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Cheat name"},"body":{"type":"string","description":"Cheat code body (GameShark format)"},"type":{"type":"string","default":"gameshark","description":"Code type"},"activation":{"type":"string","enum":["manual","end_frame"],"default":"manual","description":"When the code is applied"}},"required":["name","body"]},"title":"Create Cheat","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
 {"name":"import_cheats","description":"Import cheat codes from text in various formats. Returns: {status: 'imported', count, codes: [{name, type, activation}]}.","inputSchema":{"type":"object","properties":{"content":{"type":"string","description":"Cheat code text content"},"format":{"type":"string","enum":["duckstation","pcsx","libretro","epsxe"],"description":"Input format"}},"required":["content","format"]},"title":"Import Cheats","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
-{"name":"export_cheats","description":"Export all cheats for the current game to a file. Returns: {status: 'exported', path, count}.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Output file path"}},"required":["path"]},"title":"Export Cheats","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
+)json" R"json(
+{"name":"export_cheats","description":"Export all cheats for the current game to a file. Returns: {status: 'exported', path, count}.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Output file path"}},"required":["path"]},"title":"Export Cheats","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
 {"name":"validate_cheat","description":"Check if a cheat code body is syntactically valid (correct format, valid addresses) without saving it. Returns: {valid: bool, error?: string}.","inputSchema":{"type":"object","properties":{"body":{"type":"string","description":"Cheat code body to validate"},"type":{"type":"string","default":"gameshark","description":"Code type"},"activation":{"type":"string","default":"manual","description":"Activation type"}},"required":["body"]},"title":"Validate Cheat","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
 {"name":"get_memory_card_info","description":"Get memory card information (free blocks, files, save list) for a slot. slot defaults to 0. Returns: {slot, path, valid, free_blocks, total_blocks, file_count, files: [{filename, title, size, num_blocks, deleted}]}.","inputSchema":{"type":"object","properties":{"slot":{"type":"integer","minimum":0,"maximum":1,"default":0,"description":"Memory card slot (0 or 1)"}}},"title":"Get Memory Card Info","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
-{"name":"read_memory_card_file","description":"Read a save file from a PS1 memory card and write it to a temporary file. Returns: {slot, filename, title, size, num_blocks, output_path}.","inputSchema":{"type":"object","properties":{"slot":{"type":"integer","minimum":0,"maximum":1,"description":"Memory card slot"},"filename":{"type":"string","description":"Filename on the memory card"}},"required":["slot","filename"]},"title":"Read Memory Card File","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
+{"name":"read_memory_card_file","description":"Read a save file from a PS1 memory card and write it to a temporary file. Returns: {slot, filename, title, size, num_blocks, output_path}.","inputSchema":{"type":"object","properties":{"slot":{"type":"integer","minimum":0,"maximum":1,"description":"Memory card slot"},"filename":{"type":"string","description":"Filename on the memory card"}},"required":["slot","filename"]},"title":"Read Memory Card File","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
 {"name":"delete_memory_card_file","description":"Delete a file from a memory card. Returns: {status: 'deleted', slot, filename, free_blocks}.","inputSchema":{"type":"object","properties":{"slot":{"type":"integer","minimum":0,"maximum":1,"description":"Memory card slot"},"filename":{"type":"string","description":"Filename to delete"}},"required":["slot","filename"]},"title":"Delete Memory Card File","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}},
-{"name":"export_memory_card_save","description":"Export a save file from a memory card to disk. Returns: {status: 'exported', slot, filename, output_path}.","inputSchema":{"type":"object","properties":{"slot":{"type":"integer","minimum":0,"maximum":1,"description":"Memory card slot"},"filename":{"type":"string","description":"Filename on the memory card"},"output_path":{"type":"string","description":"Output file path"}},"required":["slot","filename","output_path"]},"title":"Export Memory Card Save","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
+{"name":"export_memory_card_save","description":"Export a save file from a memory card to disk. Returns: {status: 'exported', slot, filename, output_path}.","inputSchema":{"type":"object","properties":{"slot":{"type":"integer","minimum":0,"maximum":1,"description":"Memory card slot"},"filename":{"type":"string","description":"Filename on the memory card"},"output_path":{"type":"string","description":"Output file path"}},"required":["slot","filename","output_path"]},"title":"Export Memory Card Save","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
 {"name":"import_memory_card_save","description":"Import a save file into a memory card. Returns: {status: 'imported', slot, input_path, free_blocks}.","inputSchema":{"type":"object","properties":{"slot":{"type":"integer","minimum":0,"maximum":1,"description":"Memory card slot"},"input_path":{"type":"string","description":"Input save file path"}},"required":["slot","input_path"]},"title":"Import Memory Card Save","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
 {"name":"list_shaders","description":"List all available post-processing shaders. Returns: {count, shaders: [{name, type}]}.","inputSchema":{"type":"object","properties":{}},"title":"List Shaders","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
 {"name":"get_shader_chain","description":"Get the current post-processing shader chain configuration. Returns: {enabled, stage_count, stages: [{index, shader_name, enabled}]}.","inputSchema":{"type":"object","properties":{}},"title":"Get Shader Chain","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
@@ -7121,9 +7661,9 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
 {"name":"trigger_hotkey","description":"Trigger a hotkey by name (simulates press and release). Returns: {status: 'triggered', name, display_name}.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Hotkey name"}},"required":["name"]},"title":"Trigger Hotkey","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
 {"name":"get_disc_info","description":"Get disc track information for the current media. Returns: {media_path, disc_region, is_ps1_disc, is_audio_cd, track_count, tracks: [{track_number, mode, start_lba, length, bytes_per_sector, is_data}]}.","inputSchema":{"type":"object","properties":{}},"title":"Get Disc Info","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
 {"name":"list_disc_files","description":"List files and directories on the game disc ISO9660 filesystem. Returns: {path, entries: [{name, is_directory, size, lba, sectors}], count}.","inputSchema":{"type":"object","properties":{"path":{"type":"string","default":"/","description":"Directory path to list (default: root)"},"recursive":{"type":"boolean","default":false,"description":"Recursively list subdirectories"}}},"title":"List Disc Files","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
-{"name":"read_disc_file","description":"Read a file from the game disc ISO9660 filesystem and save it to a temporary file. Max file size: 700MB. Returns: {path, size, output_path}.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path on the disc (e.g. '/PSX.EXE', '/DATA/INGS.BIN')"}},"required":["path"]},"title":"Read Disc File","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
-{"name":"read_disc_sectors","description":"Read raw CD-ROM sectors by LBA (2352 bytes each) and save to a temporary file. Max 4096 sectors per call (~9.4MB). Returns: {lba, count, size, output_path}.","inputSchema":{"type":"object","properties":{"lba":{"type":"integer","description":"Starting logical block address"},"count":{"type":"integer","default":1,"description":"Number of sectors to read (max 4096)"}},"required":["lba"]},"title":"Read Disc Sectors","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
-{"name":"read_vram_region","description":"Read a rectangular region of PS1 VRAM (1024x512, 16-bit) and save to a temporary file. Format: png (visual) or raw (u16 pixels for analysis). Returns: {x, y, width, height, format, output_path}.","inputSchema":{"type":"object","properties":{"x":{"type":"integer","description":"Left edge (0-1023)"},"y":{"type":"integer","description":"Top edge (0-511)"},"width":{"type":"integer","description":"Width in pixels"},"height":{"type":"integer","description":"Height in pixels"},"format":{"type":"string","enum":["png","raw"],"default":"png","description":"Output format: png (RGBA8) or raw (u16 1555 ABGR)"}},"required":["x","y","width","height"]},"title":"Read VRAM Region","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
+{"name":"read_disc_file","description":"Read a file from the game disc ISO9660 filesystem and save it to a temporary file. Max file size: 700MB. Returns: {path, size, output_path}.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path on the disc (e.g. '/PSX.EXE', '/DATA/INGS.BIN')"}},"required":["path"]},"title":"Read Disc File","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
+{"name":"read_disc_sectors","description":"Read raw CD-ROM sectors by LBA (2352 bytes each) and save to a temporary file. Max 4096 sectors per call (~9.4MB). Returns: {lba, count, size, output_path}.","inputSchema":{"type":"object","properties":{"lba":{"type":"integer","description":"Starting logical block address"},"count":{"type":"integer","default":1,"description":"Number of sectors to read (max 4096)"}},"required":["lba"]},"title":"Read Disc Sectors","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
+{"name":"read_vram_region","description":"Read a rectangular region of PS1 VRAM (1024x512, 16-bit) and save to a temporary file. Format: png (visual) or raw (u16 pixels for analysis). Returns: {x, y, width, height, format, output_path}.","inputSchema":{"type":"object","properties":{"x":{"type":"integer","description":"Left edge (0-1023)"},"y":{"type":"integer","description":"Top edge (0-511)"},"width":{"type":"integer","description":"Width in pixels"},"height":{"type":"integer","description":"Height in pixels"},"format":{"type":"string","enum":["png","raw"],"default":"png","description":"Output format: png (RGBA8) or raw (u16 1555 ABGR)"}},"required":["x","y","width","height"]},"title":"Read VRAM Region","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
 {"name":"write_vram_region","description":"Write raw u16 pixel data from a file into a VRAM region. Returns: {x, y, width, height, status: 'written'}.","inputSchema":{"type":"object","properties":{"x":{"type":"integer","description":"Left edge (0-1023)"},"y":{"type":"integer","description":"Top edge (0-511)"},"width":{"type":"integer","description":"Width in pixels"},"height":{"type":"integer","description":"Height in pixels"},"input_path":{"type":"string","description":"Path to raw u16 pixel data file (must be width*height*2 bytes)"},"format":{"type":"string","enum":["raw"],"default":"raw","description":"Input format (currently only raw supported)"}},"required":["x","y","width","height","input_path"]},"title":"Write VRAM Region","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}},
 {"name":"snapshot_memory","description":"Take a snapshot of PS1 RAM for later comparison. Workflow: 1) snapshot_memory, 2) let the game run or perform actions, 3) diff_memory to see what changed. Returns: {address, physical_address, size}.","inputSchema":{"type":"object","properties":{"address":{"type":"string","default":"0x80000000","description":"Start address (hex string, default: start of RAM)"},"size":{"type":"integer","description":"Number of bytes to snapshot (default: entire RAM from address)"}}},"title":"Snapshot Memory","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
 {"name":"diff_memory","description":"Compare current PS1 RAM with the last snapshot from snapshot_memory. Must call snapshot_memory first. Returns: {address, size, changes: [{offset, address, old_value, new_value}], total_changes, truncated} (max 500 changes shown).","inputSchema":{"type":"object","properties":{}},"title":"Diff Memory","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
@@ -7131,6 +7671,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
 {"name":"breakpoint","description":"Manage breakpoints and watchpoints. Actions: add (create), remove (delete), list (show all), enable/disable (toggle without removing), clear (remove all). For add/remove/enable/disable: type and address are required. Returns: For add: {address, type}. For list: array of {address, type, enabled, hit_count}. For enable/disable: {success, address, type, enabled}. For clear: {success}.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["add","remove","list","enable","disable","clear"],"description":"Action to perform"},"type":{"type":"string","enum":["execute","read","write"],"default":"execute","description":"Breakpoint type (for add/remove/enable/disable)"},"address":{"description":"Address (integer or hex string, for add/remove/enable/disable)"}},"required":["action"]},"title":"Breakpoint","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
 {"name":"get_hardware_state","description":"Get hardware subsystem state. subsystem='dma': DMA controller (all 7 channels, DPCR, DICR). subsystem='timers': hardware timers (counter, target, clock source). subsystem='interrupts': interrupt controller (per-IRQ status, mask, active). subsystem='mdec': Motion Decoder (active, decoding, FIFO, current block). subsystem='timing_events': all active timing events (period, interval, next tick). Returns: JSON object with subsystem-specific fields.","inputSchema":{"type":"object","properties":{"subsystem":{"type":"string","enum":["dma","timers","interrupts","mdec","timing_events"],"description":"Hardware subsystem to query"}},"required":["subsystem"]},"title":"Get Hardware State","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
 {"name":"memory_scan","description":"Iterative memory scanner (cheat search). Workflow: start to find initial matches, refine to narrow down, results to read matches, reset to clear. For one-shot pattern search use search_memory instead. Returns: For start/refine: {status, result_count}. For results: {total_results, offset, count, results: [{address, value, last_value, first_value, value_changed}]}. For reset: {status, result_count: 0}.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["start","refine","results","reset"],"description":"Action to perform"},"value":{"description":"Value to search for (for start/refine)"},"size":{"type":"string","enum":["byte","halfword","word"],"default":"word","description":"Memory access size (for start)"},"operator":{"type":"string","enum":["equal","not_equal","less_than","less_equal","greater_than","greater_equal","any","changed","decreased","increased","less_than_last","less_equal_last","greater_than_last","greater_equal_last","not_equal_last","equal_last"],"description":"Comparison operator (for start/refine)"},"signed":{"type":"boolean","default":false,"description":"Treat values as signed (for start)"},"start":{"type":"string","description":"Start address hex (for start)"},"end":{"type":"string","description":"End address hex (for start)"},"offset":{"type":"integer","default":0,"description":"Result offset (for results)"},"count":{"type":"integer","default":100,"description":"Number of results (for results)"}},"required":["action"]},"title":"Memory Scan","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
+)json" R"json(
 {"name":"memory_watch","description":"Manage memory address watches. Actions: add (create watch), remove (delete watch by address), list (show all watches with current values). Returns: For add: {status, address, size, freeze, total_watches}. For remove: {status, address, total_watches}. For list: {count, watches: [{description, address, value, size, is_signed, freeze, changed}]}.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["add","remove","list"],"description":"Action to perform"},"address":{"description":"Memory address (for add/remove)"},"size":{"type":"string","enum":["byte","halfword","word"],"default":"word","description":"Access size (for add)"},"description":{"type":"string","description":"Watch description (for add)"},"signed":{"type":"boolean","default":false,"description":"Treat as signed (for add)"},"freeze":{"type":"boolean","default":false,"description":"Freeze value (for add)"}},"required":["action"]},"title":"Memory Watch","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
 {"name":"vram_watch","description":"Manage VRAM write watchpoints. Actions: add (set watchpoint on VRAM region), remove (delete by ID), list (show all), last_hit (get PC and coords of last hit). Returns: For add: {id, x, y, width, height}. For remove: {status, id}. For list: {watches: [{id, x, y, width, height}]}. For last_hit: {pc, x, y, width, height, regs: {...}, stack: [...]}.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["add","remove","list","last_hit"],"description":"Action to perform"},"x":{"type":"integer","minimum":0,"maximum":1023,"description":"Left edge (for add)"},"y":{"type":"integer","minimum":0,"maximum":511,"description":"Top edge (for add)"},"width":{"type":"integer","minimum":1,"maximum":1024,"description":"Width (for add)"},"height":{"type":"integer","minimum":1,"maximum":512,"description":"Height (for add)"},"id":{"type":"integer","description":"Watchpoint ID (for remove)"}},"required":["action"]},"title":"VRAM Watch","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
 {"name":"capture","description":"Control video/audio capture recording. Actions: start (begin recording), stop (end recording), status (check if capturing). Returns: For start: {status, path, capturing_audio, capturing_video}. For stop: {status}. For status: {active, path?, video_width?, video_height?, video_fps?, elapsed_time_seconds?}.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["start","stop","status"],"description":"Action to perform"},"path":{"type":"string","description":"Output file path (for start, optional)"}},"required":["action"]},"title":"Capture","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
@@ -7786,17 +8327,59 @@ std::string MCPServer::ClientSocket::GenerateSessionId()
 {
   // Generate a crypto-secure session ID per MCP spec §2.5.1.
   // 32 random hex characters = 128 bits of entropy.
+  // std::random_device on modern platforms uses an OS-provided CSPRNG (RtlGenRandom on
+  // Windows, /dev/urandom on Linux, arc4random/getentropy on macOS). Pull bytes from it
+  // directly — do NOT route through std::mt19937, which is deterministic given its seed.
   std::random_device rd;
-  std::mt19937_64 gen(rd());
-  std::uniform_int_distribution<u64> dist;
-  return fmt::format("{:016x}{:016x}", dist(gen), dist(gen));
+  u32 words[4];
+  for (u32& w : words)
+    w = rd();
+  return fmt::format("{:08x}{:08x}{:08x}{:08x}", words[0], words[1], words[2], words[3]);
 }
 
 void MCPServer::ClientSocket::SendSSEEvent(std::string_view event_name, std::string_view data_json)
 {
-  const std::string event = fmt::format("event: {}\ndata: {}\n\n", event_name, data_json);
+  const u64 event_id = s_sse_next_event_id++;
+  const std::string event =
+    fmt::format("id: {}\nevent: {}\ndata: {}\n\n", event_id, event_name, data_json);
+
+  // Append to replay buffer (bounded by both event count and total bytes).
+  s_sse_replay_buffer.push_back({event_id, std::string(event_name), std::string(data_json)});
+  s_sse_replay_bytes += event.size();
+  while (s_sse_replay_buffer.size() > SSE_REPLAY_MAX_EVENTS ||
+         s_sse_replay_bytes > SSE_REPLAY_MAX_BYTES)
+  {
+    if (s_sse_replay_buffer.empty())
+      break;
+    SSEEventRecord& front = s_sse_replay_buffer.front();
+    const size_t front_bytes = front.event_name.size() + front.data_json.size() + 32;
+    s_sse_replay_bytes = (s_sse_replay_bytes > front_bytes) ? (s_sse_replay_bytes - front_bytes) : 0;
+    s_sse_replay_buffer.pop_front();
+  }
+
   if (size_t written = Write(event.data(), event.size()); written != event.size())
     ERROR_LOG("Only wrote {} of {} SSE event bytes.", written, event.size());
+}
+
+int MCPServer::ClientSocket::ReplaySSEEventsFrom(u64 last_event_id)
+{
+  if (s_sse_replay_buffer.empty())
+    return 0;
+  // If the buffer has rolled past last_event_id, we cannot fully replay.
+  if (last_event_id + 1 < s_sse_replay_buffer.front().id)
+    return -1;
+  int replayed = 0;
+  for (const SSEEventRecord& rec : s_sse_replay_buffer)
+  {
+    if (rec.id <= last_event_id)
+      continue;
+    const std::string event =
+      fmt::format("id: {}\nevent: {}\ndata: {}\n\n", rec.id, rec.event_name, rec.data_json);
+    if (size_t written = Write(event.data(), event.size()); written != event.size())
+      ERROR_LOG("Only wrote {} of {} SSE replay bytes.", written, event.size());
+    ++replayed;
+  }
+  return replayed;
 }
 
 std::string MCPServer::ClientSocket::MakeJsonRpcResponse(const JsonValue& id, std::string_view result_json)
@@ -7847,7 +8430,8 @@ void MCPServer::ClientSocket::OnSystemPaused()
   if (m_is_sse)
   {
     const std::string pc_hex = System::IsValid() ? FormatHex32(CPU::g_state.pc) : "0x00000000";
-    const std::string data = fmt::format("{{\"pc\":\"{}\",\"reason\":\"user\"}}", pc_hex);
+    const std::string_view reason = s_next_pause_reason.empty() ? "user" : std::string_view(s_next_pause_reason);
+    const std::string data = fmt::format("{{\"pc\":\"{}\",\"reason\":\"{}\"}}", pc_hex, reason);
     SendSSEEvent("system_paused", data);
   }
 }
@@ -7970,6 +8554,9 @@ void MCPServer::OnSystemPaused()
 
   for (auto& it : s_sse_clients)
     it->OnSystemPaused();
+
+  // Reset the pending reason once delivered — subsequent pauses default to "user".
+  s_next_pause_reason.clear();
 
   NotifyResourceUpdated("emulator://status");
   NotifyResourceUpdated("emulator://registers");
