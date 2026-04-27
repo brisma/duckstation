@@ -101,9 +101,16 @@ static constexpr size_t MAX_SSE_CLIENTS = 4;
 /// Frontend callback for post-tool-call UI refresh.
 static StateChangedCallback s_state_changed_callback;
 
+/// JSON-RPC 2.0 standard error codes (§5.1). Mirrored as named constants here so call
+/// sites read uniformly with the MCP-specific codes below rather than mixing literals.
+static constexpr int JSONRPC_PARSE_ERROR = -32700;
+static constexpr int JSONRPC_INVALID_REQUEST = -32600;
+static constexpr int JSONRPC_METHOD_NOT_FOUND = -32601;
+static constexpr int JSONRPC_INVALID_PARAMS = -32602;
+static constexpr int JSONRPC_INTERNAL_ERROR = -32603;
+
 /// MCP-specific JSON-RPC error codes. JSON-RPC reserves -32000 to -32099 for application-
-/// defined server errors. Standard codes (-32600 InvalidRequest, -32601 MethodNotFound,
-/// -32602 InvalidParams, -32603 InternalError) are used directly where appropriate.
+/// defined server errors.
 static constexpr int MCP_ERR_SYSTEM_NOT_RUNNING = -32001;
 static constexpr int MCP_ERR_OPERATION_FAILED = -32002;
 static constexpr int MCP_ERR_PRECONDITION_FAILED = -32003;
@@ -489,7 +496,7 @@ static std::optional<std::string> ValidateMCPPath(std::string_view raw_path, std
 
 /// Validate an args["<key>"] path argument. Combines presence/type check with
 /// ValidateMCPPath. Returns nullopt on failure (and populates *error_out with a message
-/// suitable for inclusion in a -32602 ToolResult::Error response).
+/// suitable for inclusion in a JSONRPC_INVALID_PARAMS ToolResult::Error response).
 static std::optional<std::string> ValidatePathArg(const JsonValue& args, const char* key, std::string* error_out)
 {
   if (!args.contains(key) || !args[key].is_string())
@@ -515,6 +522,22 @@ static std::optional<u32> ParseAddress(const JsonValue& val)
     return StringUtil::FromChars<u32>(s);
   }
   return std::nullopt;
+}
+
+/// Render a JsonValue compactly for inclusion in error messages. Strings are quoted,
+/// numbers and bools are stringified, anything else becomes a type tag like "<array>"
+/// so we can echo the offending input back to the caller without leaking nested data.
+static std::string DescribeJsonForError(const JsonValue& val)
+{
+  if (val.is_null()) return "null";
+  if (val.is_bool()) return val.get_bool() ? "true" : "false";
+  if (val.is_number_unsigned()) return fmt::format("{}", val.get_uint());
+  if (val.is_number_integer()) return fmt::format("{}", val.get_int());
+  if (val.is_number()) return fmt::format("{}", val.get_float());
+  if (val.is_string()) return fmt::format("\"{}\"", val.get_string());
+  if (val.is_array()) return "<array>";
+  if (val.is_object()) return "<object>";
+  return "<unknown>";
 }
 
 static std::string FormatHex32(u32 val)
@@ -565,14 +588,15 @@ static ToolResult HandlePressButton(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("button") || !args["button"].is_string())
-    return ToolResult::Error(-32602, "Missing 'button' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'button' parameter");
 
   u32 slot = 0;
   if (args.contains("slot") && args["slot"].is_number_unsigned())
     slot = static_cast<u32>(args["slot"].get_uint());
 
   if (slot >= NUM_CONTROLLER_AND_CARD_PORTS)
-    return ToolResult::Error(-32602, "Invalid slot number");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Invalid slot number {} (must be 0..{})", slot,
+                                                 NUM_CONTROLLER_AND_CARD_PORTS - 1));
 
   Controller* controller = GetControllerForSlot(slot);
   if (!controller)
@@ -582,7 +606,7 @@ static ToolResult HandlePressButton(const JsonValue& args)
   const ControllerType type = controller->GetType();
   const std::optional<u32> bind_index = ResolveBindIndex(controller, type, button_name);
   if (!bind_index.has_value())
-    return ToolResult::Error(-32602, fmt::format("Unknown button '{}'", button_name));
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Unknown button '{}'", button_name));
 
   controller->SetBindState(bind_index.value(), 1.0f);
 
@@ -610,14 +634,15 @@ static ToolResult HandleReleaseButton(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("button") || !args["button"].is_string())
-    return ToolResult::Error(-32602, "Missing 'button' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'button' parameter");
 
   u32 slot = 0;
   if (args.contains("slot") && args["slot"].is_number_unsigned())
     slot = static_cast<u32>(args["slot"].get_uint());
 
   if (slot >= NUM_CONTROLLER_AND_CARD_PORTS)
-    return ToolResult::Error(-32602, "Invalid slot number");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Invalid slot number {} (must be 0..{})", slot,
+                                                 NUM_CONTROLLER_AND_CARD_PORTS - 1));
 
   Controller* controller = GetControllerForSlot(slot);
   if (!controller)
@@ -627,7 +652,7 @@ static ToolResult HandleReleaseButton(const JsonValue& args)
   const ControllerType type = controller->GetType();
   const std::optional<u32> bind_index = ResolveBindIndex(controller, type, button_name);
   if (!bind_index.has_value())
-    return ToolResult::Error(-32602, fmt::format("Unknown button '{}'", button_name));
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Unknown button '{}'", button_name));
 
   controller->SetBindState(bind_index.value(), 0.0f);
 
@@ -646,18 +671,19 @@ static ToolResult HandleSetAnalog(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("stick") || !args["stick"].is_string())
-    return ToolResult::Error(-32602, "Missing 'stick' parameter (\"left\" or \"right\")");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'stick' parameter (\"left\" or \"right\")");
   if (!args.contains("x") || !args["x"].is_number())
-    return ToolResult::Error(-32602, "Missing 'x' parameter (float -1.0 to 1.0)");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'x' parameter (float -1.0 to 1.0)");
   if (!args.contains("y") || !args["y"].is_number())
-    return ToolResult::Error(-32602, "Missing 'y' parameter (float -1.0 to 1.0)");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'y' parameter (float -1.0 to 1.0)");
 
   u32 slot = 0;
   if (args.contains("slot") && args["slot"].is_number_unsigned())
     slot = static_cast<u32>(args["slot"].get_uint());
 
   if (slot >= NUM_CONTROLLER_AND_CARD_PORTS)
-    return ToolResult::Error(-32602, "Invalid slot number");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Invalid slot number {} (must be 0..{})", slot,
+                                                 NUM_CONTROLLER_AND_CARD_PORTS - 1));
 
   Controller* controller = GetControllerForSlot(slot);
   if (!controller)
@@ -693,7 +719,8 @@ static ToolResult HandleSetAnalog(const JsonValue& args)
   }
   else
   {
-    return ToolResult::Error(-32602, "Invalid stick name, use \"left\" or \"right\"");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                             fmt::format("Invalid 'stick' value '{}', use \"left\" or \"right\"", stick));
   }
 
   // Convert x/y to half-axis values.
@@ -733,7 +760,8 @@ static ToolResult HandleGetControllerState(const JsonValue& args)
     slot = static_cast<u32>(args["slot"].get_uint());
 
   if (slot >= NUM_CONTROLLER_AND_CARD_PORTS)
-    return ToolResult::Error(-32602, "Invalid slot number");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Invalid slot number {} (must be 0..{})", slot,
+                                                 NUM_CONTROLLER_AND_CARD_PORTS - 1));
 
   Controller* controller = GetControllerForSlot(slot);
   if (!controller)
@@ -839,7 +867,7 @@ static ToolResult HandleInputSequence(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("sequence") || !args["sequence"].is_array())
-    return ToolResult::Error(-32602, "Missing 'sequence' array parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'sequence' array parameter");
 
   if (s_active_sequence.has_value())
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"An input sequence is already active");
@@ -849,7 +877,8 @@ static ToolResult HandleInputSequence(const JsonValue& args)
     slot = static_cast<u32>(args["slot"].get_uint());
 
   if (slot >= NUM_CONTROLLER_AND_CARD_PORTS)
-    return ToolResult::Error(-32602, "Invalid slot number");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Invalid slot number {} (must be 0..{})", slot,
+                                                 NUM_CONTROLLER_AND_CARD_PORTS - 1));
 
   Controller* controller = GetControllerForSlot(slot);
   if (!controller)
@@ -864,24 +893,24 @@ static ToolResult HandleInputSequence(const JsonValue& args)
   for (const auto& step_json : seq_array)
   {
     if (!step_json.contains("buttons") || !step_json["buttons"].is_array())
-      return ToolResult::Error(-32602, "Each step must have a 'buttons' array");
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Each step must have a 'buttons' array");
     if (!step_json.contains("duration_frames") || !step_json["duration_frames"].is_number_unsigned())
-      return ToolResult::Error(-32602, "Each step must have 'duration_frames'");
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Each step must have 'duration_frames'");
 
     InputSequenceStep step;
     step.duration_frames = static_cast<u32>(step_json["duration_frames"].get_uint());
     if (step.duration_frames == 0)
-      return ToolResult::Error(-32602, "duration_frames must be > 0");
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, "duration_frames must be > 0");
 
     for (const auto& btn : step_json["buttons"])
     {
       if (!btn.is_string())
-        return ToolResult::Error(-32602, "Button names must be strings");
+        return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Button names must be strings");
 
       const std::string btn_name = std::string(btn.get_string());
       const std::optional<u32> idx = ResolveBindIndex(controller, type, btn_name);
       if (!idx.has_value())
-        return ToolResult::Error(-32602, fmt::format("Unknown button '{}'", btn_name));
+        return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Unknown button '{}'", btn_name));
 
       step.bind_indices.push_back(idx.value());
     }
@@ -891,7 +920,7 @@ static ToolResult HandleInputSequence(const JsonValue& args)
   }
 
   if (steps.empty())
-    return ToolResult::Error(-32602, "Sequence must have at least one step");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Sequence must have at least one step");
 
   const u32 seq_id = s_next_sequence_id++;
 
@@ -972,11 +1001,11 @@ static ToolResult HandleGetSettings([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleSetSetting(const JsonValue& args)
 {
   if (!args.contains("section") || !args["section"].is_string())
-    return ToolResult::Error(-32602, "Missing 'section' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'section' parameter");
   if (!args.contains("key") || !args["key"].is_string())
-    return ToolResult::Error(-32602, "Missing 'key' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'key' parameter");
   if (!args.contains("value"))
-    return ToolResult::Error(-32602, "Missing 'value' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'value' parameter");
 
   const std::string section = std::string(args["section"].get_string());
   const std::string key = std::string(args["key"].get_string());
@@ -987,24 +1016,25 @@ static ToolResult HandleSetSetting(const JsonValue& args)
   if (setting_path == "GPU/ResolutionScale")
   {
     if (!args["value"].is_number_unsigned())
-      return ToolResult::Error(-32602, "ResolutionScale must be an unsigned integer");
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, "ResolutionScale must be an unsigned integer");
     const u32 scale = static_cast<u32>(args["value"].get_uint());
     if (scale < 1 || scale > 16)
-      return ToolResult::Error(-32602, "GPU/ResolutionScale must be between 1 and 16");
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                               fmt::format("GPU/ResolutionScale must be between 1 and 16 (got {})", scale));
     g_settings.gpu_resolution_scale = static_cast<u8>(scale);
     applied = true;
   }
   else if (setting_path == "GPU/PGXP")
   {
     if (!args["value"].is_bool())
-      return ToolResult::Error(-32602, "PGXP must be a boolean");
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, "PGXP must be a boolean");
     g_settings.gpu_pgxp_enable = args["value"].get_bool();
     applied = true;
   }
   else if (setting_path == "CPU/Overclock")
   {
     if (!args["value"].is_bool())
-      return ToolResult::Error(-32602, "Overclock must be a boolean");
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Overclock must be a boolean");
     g_settings.cpu_overclock_enable = args["value"].get_bool();
     System::UpdateOverclock();
     applied = true;
@@ -1012,7 +1042,7 @@ static ToolResult HandleSetSetting(const JsonValue& args)
   else if (setting_path == "CPU/OverclockNumerator")
   {
     if (!args["value"].is_number_unsigned())
-      return ToolResult::Error(-32602, "OverclockNumerator must be an unsigned integer");
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, "OverclockNumerator must be an unsigned integer");
     g_settings.cpu_overclock_numerator = static_cast<u32>(args["value"].get_uint());
     System::UpdateOverclock();
     applied = true;
@@ -1020,7 +1050,7 @@ static ToolResult HandleSetSetting(const JsonValue& args)
   else if (setting_path == "CPU/OverclockDenominator")
   {
     if (!args["value"].is_number_unsigned())
-      return ToolResult::Error(-32602, "OverclockDenominator must be an unsigned integer");
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, "OverclockDenominator must be an unsigned integer");
     g_settings.cpu_overclock_denominator = static_cast<u32>(args["value"].get_uint());
     System::UpdateOverclock();
     applied = true;
@@ -1028,34 +1058,34 @@ static ToolResult HandleSetSetting(const JsonValue& args)
   else if (setting_path == "Audio/OutputVolume")
   {
     if (!args["value"].is_number_unsigned())
-      return ToolResult::Error(-32602, "OutputVolume must be an unsigned integer (0-100)");
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, "OutputVolume must be an unsigned integer (0-100)");
     g_settings.audio_output_volume = static_cast<u8>(std::min(static_cast<u32>(args["value"].get_uint()), 100u));
     applied = true;
   }
   else if (setting_path == "Audio/Muted")
   {
     if (!args["value"].is_bool())
-      return ToolResult::Error(-32602, "Muted must be a boolean");
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Muted must be a boolean");
     g_settings.audio_output_muted = args["value"].get_bool();
     applied = true;
   }
   else if (setting_path == "CDROM/ReadSpeedup")
   {
     if (!args["value"].is_number_unsigned())
-      return ToolResult::Error(-32602, "ReadSpeedup must be an unsigned integer");
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, "ReadSpeedup must be an unsigned integer");
     g_settings.cdrom_read_speedup = static_cast<u8>(args["value"].get_uint());
     applied = true;
   }
   else if (setting_path == "CDROM/SeekSpeedup")
   {
     if (!args["value"].is_number_unsigned())
-      return ToolResult::Error(-32602, "SeekSpeedup must be an unsigned integer");
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, "SeekSpeedup must be an unsigned integer");
     g_settings.cdrom_seek_speedup = static_cast<u8>(args["value"].get_uint());
     applied = true;
   }
   else
   {
-    return ToolResult::Error(-32602,
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
                              fmt::format("Unsupported setting: {}. Supported: GPU/ResolutionScale, GPU/PGXP, "
                                          "CPU/Overclock, CPU/OverclockNumerator, CPU/OverclockDenominator, "
                                          "Audio/OutputVolume, Audio/Muted, CDROM/ReadSpeedup, CDROM/SeekSpeedup",
@@ -1082,7 +1112,7 @@ static ToolResult HandleSetSpeed(const JsonValue& args)
   {
     const float speed = static_cast<float>(args["speed"].get_float());
     if (speed <= 0.0f || speed > 100.0f)
-      return ToolResult::Error(-32602, "Speed must be between 0.01 and 100.0");
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Speed must be between 0.01 and 100.0 (got {})", speed));
     g_settings.emulation_speed = speed;
     System::UpdateSpeedLimiterState();
   }
@@ -1117,7 +1147,7 @@ static ToolResult HandleTakeScreenshot(const JsonValue& args)
     std::string err;
     auto vp = ValidateMCPPath(args["path"].get_string(), &err);
     if (!vp)
-      return ToolResult::Error(-32602, std::move(err));
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, std::move(err));
     path = std::move(*vp);
   }
   else
@@ -1282,7 +1312,7 @@ static ToolResult HandleApplyCheat(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("name") || !args["name"].is_string())
-    return ToolResult::Error(-32602, "Missing 'name' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'name' parameter");
 
   const std::string name = std::string(args["name"].get_string());
 
@@ -1303,7 +1333,7 @@ static ToolResult HandleToggleCheat(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("name") || !args["name"].is_string())
-    return ToolResult::Error(-32602, "Missing 'name' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'name' parameter");
 
   const std::string name = std::string(args["name"].get_string());
 
@@ -1370,14 +1400,14 @@ static ToolResult HandleInsertDisc(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("path") || !args["path"].is_string())
-    return ToolResult::Error(-32602, "Missing 'path' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'path' parameter");
 
   std::string path;
   {
     std::string err;
     auto vp = ValidatePathArg(args, "path", &err);
     if (!vp)
-      return ToolResult::Error(-32602, std::move(err));
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, std::move(err));
     path = std::move(*vp);
   }
 
@@ -1437,7 +1467,8 @@ static ToolResult HandleSwitchDisc(const JsonValue& args)
     else if (direction == "previous")
       success = System::SwitchToPreviousDisc(false);
     else
-      return ToolResult::Error(-32602, "Invalid direction. Use 'next' or 'previous'.");
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                               fmt::format("Invalid 'direction' value '{}'. Use 'next' or 'previous'.", direction));
 
     if (!success)
       return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to switch to {} disc", direction));
@@ -1450,7 +1481,7 @@ static ToolResult HandleSwitchDisc(const JsonValue& args)
     return ToolResult{w.TakeOutput()};
   }
 
-  return ToolResult::Error(-32602, "Must provide 'index' or 'direction' parameter");
+  return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Must provide 'index' or 'direction' parameter");
 }
 
 static ToolResult HandleListDiscs([[maybe_unused]] const JsonValue& args)
@@ -1539,14 +1570,14 @@ static ToolResult HandleBootGame(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System is already running. Shut down first.");
 
   if (!args.contains("path") || !args["path"].is_string())
-    return ToolResult::Error(-32602, "Missing 'path' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'path' parameter");
 
   std::string path;
   {
     std::string err;
     auto vp = ValidatePathArg(args, "path", &err);
     if (!vp)
-      return ToolResult::Error(-32602, std::move(err));
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, std::move(err));
     path = std::move(*vp);
   }
 
@@ -1643,14 +1674,16 @@ static ToolResult HandleWriteRegister(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("name") || !args["name"].is_string())
-    return ToolResult::Error(-32602, "Missing 'name' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'name' parameter");
   if (!args.contains("value"))
-    return ToolResult::Error(-32602, "Missing 'value' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'value' parameter");
 
   const std::string name = std::string(args["name"].get_string());
   const std::optional<u32> value = ParseAddress(args["value"]);
   if (!value.has_value())
-    return ToolResult::Error(-32602, "Invalid value format");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                             fmt::format("Invalid 'value' — got {} (expected unsigned int or hex string)",
+                                         DescribeJsonForError(args["value"])));
 
   // Find the register by name.
   for (u32 i = 0; i < CPU::NUM_DEBUGGER_REGISTER_LIST_ENTRIES; i++)
@@ -1687,7 +1720,7 @@ static ToolResult HandleDisassemble(const JsonValue& args)
   if (args.contains("address"))
     address = ParseAddress(args["address"]);
   if (!address.has_value())
-    return ToolResult::Error(-32602, "Missing or invalid 'address' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing or invalid 'address' parameter");
 
   u32 count = 20;
   if (args.contains("count") && args["count"].is_number())
@@ -1850,14 +1883,16 @@ static ToolResult HandleAddBreakpoint(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("type") || !args["type"].is_string())
-    return ToolResult::Error(-32602, "Missing 'type' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'type' parameter");
   if (!args.contains("address"))
-    return ToolResult::Error(-32602, "Missing 'address' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'address' parameter");
 
   const std::string type_str = std::string(args["type"].get_string());
   const std::optional<u32> address = ParseAddress(args["address"]);
   if (!address.has_value())
-    return ToolResult::Error(-32602, "Invalid address format");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                             fmt::format("Invalid 'address' — got {} (expected unsigned int or hex string like '0x80000000')",
+                                         DescribeJsonForError(args["address"])));
 
   CPU::BreakpointType bp_type;
   if (type_str == "execute")
@@ -1867,7 +1902,7 @@ static ToolResult HandleAddBreakpoint(const JsonValue& args)
   else if (type_str == "write")
     bp_type = CPU::BreakpointType::Write;
   else
-    return ToolResult::Error(-32602, fmt::format("Unknown breakpoint type: {}", type_str));
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Unknown breakpoint type: {}", type_str));
 
   // Idempotent: if a matching breakpoint is already present, treat it as success rather
   // than returning an ambiguous error. The LLM can re-issue set_breakpoint freely.
@@ -1897,14 +1932,16 @@ static ToolResult HandleRemoveBreakpoint(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("type") || !args["type"].is_string())
-    return ToolResult::Error(-32602, "Missing 'type' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'type' parameter");
   if (!args.contains("address"))
-    return ToolResult::Error(-32602, "Missing 'address' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'address' parameter");
 
   const std::string type_str = std::string(args["type"].get_string());
   const std::optional<u32> address = ParseAddress(args["address"]);
   if (!address.has_value())
-    return ToolResult::Error(-32602, "Invalid address format");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                             fmt::format("Invalid 'address' — got {} (expected unsigned int or hex string like '0x80000000')",
+                                         DescribeJsonForError(args["address"])));
 
   CPU::BreakpointType bp_type;
   if (type_str == "execute")
@@ -1914,7 +1951,7 @@ static ToolResult HandleRemoveBreakpoint(const JsonValue& args)
   else if (type_str == "write")
     bp_type = CPU::BreakpointType::Write;
   else
-    return ToolResult::Error(-32602, fmt::format("Unknown breakpoint type: {}", type_str));
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Unknown breakpoint type: {}", type_str));
 
   if (!CPU::RemoveBreakpoint(bp_type, address.value()))
     return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"Breakpoint not found");
@@ -2036,18 +2073,21 @@ static ToolResult HandleReadMemory(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("address"))
-    return ToolResult::Error(-32602, "Missing 'address' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'address' parameter");
   if (!args.contains("size") || !args["size"].is_number())
-    return ToolResult::Error(-32602, "Missing or invalid 'size' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing or invalid 'size' parameter");
 
   const std::optional<u32> address = ParseAddress(args["address"]);
   if (!address.has_value())
-    return ToolResult::Error(-32602, "Invalid address format");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                             fmt::format("Invalid 'address' — got {} (expected unsigned int or hex string like '0x80000000')",
+                                         DescribeJsonForError(args["address"])));
 
   const u32 size = static_cast<u32>(args["size"].get_uint());
   static constexpr u32 MAX_READ_SIZE = 2097152; // 2MB (full PS1 RAM)
   if (size == 0 || size > MAX_READ_SIZE)
-    return ToolResult::Error(-32602, "Size must be between 1 and 2097152 (2MB)");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                             fmt::format("Size must be between 1 and {} (2MB) — got {}", MAX_READ_SIZE, size));
 
   std::string format = "hex";
   if (args.contains("format") && args["format"].is_string())
@@ -2061,7 +2101,7 @@ static ToolResult HandleReadMemory(const JsonValue& args)
   static constexpr u32 MAX_INLINE_READ_SIZE = 65536;
   if (!output_to_file && size > MAX_INLINE_READ_SIZE)
   {
-    return ToolResult::Error(-32602,
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
                              fmt::format("Inline read limited to {} bytes; for size {} provide a 'path' parameter and "
                                          "the bytes will be written there as raw binary",
                                          MAX_INLINE_READ_SIZE, size));
@@ -2078,7 +2118,7 @@ static ToolResult HandleReadMemory(const JsonValue& args)
     std::string err;
     auto vp = ValidatePathArg(args, "path", &err);
     if (!vp)
-      return ToolResult::Error(-32602, std::move(err));
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, std::move(err));
     path = std::move(*vp);
   }
     Error error;
@@ -2115,11 +2155,13 @@ static ToolResult HandleWriteMemory(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("address"))
-    return ToolResult::Error(-32602, "Missing 'address' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'address' parameter");
 
   const std::optional<u32> address = ParseAddress(args["address"]);
   if (!address.has_value())
-    return ToolResult::Error(-32602, "Invalid address format");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                             fmt::format("Invalid 'address' — got {} (expected unsigned int or hex string like '0x80000000')",
+                                         DescribeJsonForError(args["address"])));
 
   std::vector<u8> buffer;
   const bool input_from_file = args.contains("path") && args["path"].is_string();
@@ -2131,7 +2173,7 @@ static ToolResult HandleWriteMemory(const JsonValue& args)
     std::string err;
     auto vp = ValidatePathArg(args, "path", &err);
     if (!vp)
-      return ToolResult::Error(-32602, std::move(err));
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, std::move(err));
     path = std::move(*vp);
   }
     Error error;
@@ -2143,7 +2185,7 @@ static ToolResult HandleWriteMemory(const JsonValue& args)
   else
   {
     if (!args.contains("data") || !args["data"].is_string())
-      return ToolResult::Error(-32602, "Missing 'data' or 'path' parameter");
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'data' or 'path' parameter");
 
     const std::string data_str = std::string(args["data"].get_string());
 
@@ -2159,17 +2201,18 @@ static ToolResult HandleWriteMemory(const JsonValue& args)
     {
       const std::optional<std::vector<u8>> decoded = StringUtil::DecodeHex(data_str);
       if (!decoded.has_value() || decoded->empty())
-        return ToolResult::Error(-32602, "Invalid hex data string");
+        return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                                 fmt::format("Invalid hex 'data' string (length {})", data_str.size()));
       buffer = decoded.value();
     }
   }
 
   if (buffer.empty())
-    return ToolResult::Error(-32602, "Data is empty");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Data is empty");
 
   static constexpr u32 MAX_WRITE_SIZE = 2097152; // 2MB
   if (buffer.size() > MAX_WRITE_SIZE)
-    return ToolResult::Error(-32602, fmt::format("Data too large: {} bytes (max {})", buffer.size(), MAX_WRITE_SIZE));
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Data too large: {} bytes (max {})", buffer.size(), MAX_WRITE_SIZE));
 
   if (!CPU::SafeWriteMemoryBytes(address.value(), std::span<const u8>(buffer)))
     return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"Failed to write memory at specified address");
@@ -2188,21 +2231,25 @@ static ToolResult HandleSearchMemory(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("pattern") || !args["pattern"].is_string())
-    return ToolResult::Error(-32602, "Missing or invalid 'pattern' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing or invalid 'pattern' parameter");
 
   u32 start_address = 0;
   if (args.contains("start"))
   {
     const std::optional<u32> parsed_start = ParseAddress(args["start"]);
     if (!parsed_start.has_value())
-      return ToolResult::Error(-32602, "Invalid start address format");
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                               fmt::format("Invalid 'start' address — got {} (expected unsigned int or hex string)",
+                                           DescribeJsonForError(args["start"])));
     start_address = parsed_start.value();
   }
 
   const std::string pattern_hex = std::string(args["pattern"].get_string());
   const std::optional<std::vector<u8>> pattern_opt = StringUtil::DecodeHex(pattern_hex);
   if (!pattern_opt.has_value() || pattern_opt->empty())
-    return ToolResult::Error(-32602, "Invalid pattern hex string");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                             fmt::format("Invalid 'pattern' hex string (length {}); expected an even-length hex string of non-zero size",
+                                         pattern_hex.size()));
 
   const std::vector<u8>& pattern = pattern_opt.value();
   std::vector<u8> mask;
@@ -2211,8 +2258,13 @@ static ToolResult HandleSearchMemory(const JsonValue& args)
   {
     const std::string mask_hex = std::string(args["mask"].get_string());
     const std::optional<std::vector<u8>> mask_opt = StringUtil::DecodeHex(mask_hex);
-    if (!mask_opt.has_value() || mask_opt->size() != pattern.size())
-      return ToolResult::Error(-32602, "Invalid mask hex string or size mismatch with pattern");
+    if (!mask_opt.has_value())
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                               fmt::format("Invalid 'mask' hex string (length {})", mask_hex.size()));
+    if (mask_opt->size() != pattern.size())
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                               fmt::format("Mask size mismatch: mask has {} byte(s), pattern has {} byte(s)",
+                                           mask_opt->size(), pattern.size()));
     mask = mask_opt.value();
   }
   else
@@ -2258,7 +2310,7 @@ static ToolResult HandleDumpRam(const JsonValue& args)
     std::string err;
     auto vp = ValidateMCPPath(args["path"].get_string(), &err);
     if (!vp)
-      return ToolResult::Error(-32602, std::move(err));
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, std::move(err));
     path = std::move(*vp);
   }
   else
@@ -2479,7 +2531,7 @@ static ToolResult HandleDumpVram(const JsonValue& args)
     std::string err;
     auto vp = ValidateMCPPath(args["path"].get_string(), &err);
     if (!vp)
-      return ToolResult::Error(-32602, std::move(err));
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, std::move(err));
     path = std::move(*vp);
   }
   else
@@ -2553,7 +2605,8 @@ static ToolResult HandleDumpVram(const JsonValue& args)
   }
   else
   {
-    return ToolResult::Error(-32602, "Invalid format. Use 'png' or 'bin'.");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                             fmt::format("Invalid 'format' value '{}'. Use 'png' or 'bin'.", format));
   }
 }
 
@@ -2568,7 +2621,7 @@ static ToolResult HandleDumpSpuRam(const JsonValue& args)
     std::string err;
     auto vp = ValidateMCPPath(args["path"].get_string(), &err);
     if (!vp)
-      return ToolResult::Error(-32602, std::move(err));
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, std::move(err));
     path = std::move(*vp);
   }
   else
@@ -2661,11 +2714,11 @@ static ToolResult HandleSaveState(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("slot") || !args["slot"].is_number_integer())
-    return ToolResult::Error(-32602, "Missing or invalid 'slot' parameter (integer 1-10)");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing or invalid 'slot' parameter (integer 1-10)");
 
   const s32 slot = static_cast<s32>(args["slot"].get_int());
   if (slot < 1 || slot > 10)
-    return ToolResult::Error(-32602, "Slot must be between 1 and 10");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Slot must be between 1 and 10 (got {})", slot));
 
   System::SaveStateToSlot(false, slot);
 
@@ -2683,11 +2736,11 @@ static ToolResult HandleLoadState(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("slot") || !args["slot"].is_number_integer())
-    return ToolResult::Error(-32602, "Missing or invalid 'slot' parameter (integer 1-10)");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing or invalid 'slot' parameter (integer 1-10)");
 
   const s32 slot = static_cast<s32>(args["slot"].get_int());
   if (slot < 1 || slot > 10)
-    return ToolResult::Error(-32602, "Slot must be between 1 and 10");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Slot must be between 1 and 10 (got {})", slot));
 
   System::LoadStateFromSlot(false, slot);
 
@@ -2721,7 +2774,7 @@ static ToolResult HandleFrameStep(const JsonValue& args)
 static ToolResult HandleWatchVramWrite(const JsonValue& args)
 {
   if (!args.contains("x") || !args.contains("y") || !args.contains("width") || !args.contains("height"))
-    return ToolResult::Error(-32602, "Missing required parameters: x, y, width, height");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing required parameters: x, y, width, height");
 
   auto x_opt = ParseAddress(args["x"]);
   auto y_opt = ParseAddress(args["y"]);
@@ -2729,10 +2782,14 @@ static ToolResult HandleWatchVramWrite(const JsonValue& args)
   auto h_opt = ParseAddress(args["height"]);
 
   if (!x_opt || !y_opt || !w_opt || !h_opt)
-    return ToolResult::Error(-32602, "Invalid parameter values");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                             fmt::format("Invalid VRAM region parameters — x={}, y={}, width={}, height={} "
+                                         "(each must be an unsigned int or hex string)",
+                                         DescribeJsonForError(args["x"]), DescribeJsonForError(args["y"]),
+                                         DescribeJsonForError(args["width"]), DescribeJsonForError(args["height"])));
 
   if (*x_opt + *w_opt > 1024 || *y_opt + *h_opt > 512)
-    return ToolResult::Error(-32602,
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
       fmt::format("VRAM watch region ({},{})+{}x{} exceeds VRAM bounds (1024x512)",
                   *x_opt, *y_opt, *w_opt, *h_opt));
 
@@ -2760,7 +2817,7 @@ static ToolResult HandleWatchVramWrite(const JsonValue& args)
 static ToolResult HandleRemoveVramWatch(const JsonValue& args)
 {
   if (!args.contains("id") || !args["id"].is_number())
-    return ToolResult::Error(-32602, "Missing required parameter: id");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing required parameter: id");
 
   const u32 id = static_cast<u32>(args["id"].get_uint());
   auto it = std::find_if(s_vram_watches.begin(), s_vram_watches.end(),
@@ -3010,15 +3067,19 @@ static ToolResult HandleEnableBreakpoint(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("address"))
-    return ToolResult::Error(-32602, "Missing 'address' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'address' parameter");
 
   const auto addr = ParseAddress(args["address"]);
   if (!addr.has_value())
-    return ToolResult::Error(-32602, "Invalid address");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                             fmt::format("Invalid 'address' — got {} (expected unsigned int or hex string)",
+                                         DescribeJsonForError(args["address"])));
 
   const auto bp_type = ParseBreakpointType(args);
   if (!bp_type.has_value())
-    return ToolResult::Error(-32602, "Invalid breakpoint type (must be 'execute', 'read', or 'write')");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                             fmt::format("Invalid breakpoint type {} (must be 'execute', 'read', or 'write')",
+                                         args.contains("type") ? DescribeJsonForError(args["type"]) : "<missing>"));
 
   if (!CPU::SetBreakpointEnabled(bp_type.value(), addr.value(), true))
     return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"Breakpoint not found at specified address");
@@ -3040,15 +3101,19 @@ static ToolResult HandleDisableBreakpoint(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("address"))
-    return ToolResult::Error(-32602, "Missing 'address' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'address' parameter");
 
   const auto addr = ParseAddress(args["address"]);
   if (!addr.has_value())
-    return ToolResult::Error(-32602, "Invalid address");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                             fmt::format("Invalid 'address' — got {} (expected unsigned int or hex string)",
+                                         DescribeJsonForError(args["address"])));
 
   const auto bp_type = ParseBreakpointType(args);
   if (!bp_type.has_value())
-    return ToolResult::Error(-32602, "Invalid breakpoint type (must be 'execute', 'read', or 'write')");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                             fmt::format("Invalid breakpoint type {} (must be 'execute', 'read', or 'write')",
+                                         args.contains("type") ? DescribeJsonForError(args["type"]) : "<missing>"));
 
   if (!CPU::SetBreakpointEnabled(bp_type.value(), addr.value(), false))
     return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"Breakpoint not found at specified address");
@@ -3126,17 +3191,19 @@ static ToolResult HandleSetGteRegister(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("index") || !args["index"].is_number_unsigned())
-    return ToolResult::Error(-32602, "Missing 'index' parameter (0-63)");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'index' parameter (0-63)");
   if (!args.contains("value"))
-    return ToolResult::Error(-32602, "Missing 'value' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'value' parameter");
 
   const u32 index = static_cast<u32>(args["index"].get_uint());
   if (index >= 64)
-    return ToolResult::Error(-32602, "Register index must be 0-63");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Register index must be 0-63 (got {})", index));
 
   const auto value = ParseAddress(args["value"]);
   if (!value.has_value())
-    return ToolResult::Error(-32602, "Invalid value");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                             fmt::format("Invalid 'value' — got {} (expected unsigned int or hex string)",
+                                         DescribeJsonForError(args["value"])));
 
   GTE::WriteRegister(index, value.value());
 
@@ -3199,7 +3266,7 @@ static ToolResult HandleGetSpuVoiceState(const JsonValue& args)
     voice_filter = static_cast<s32>(args["voice"].get_uint());
 
   if (voice_filter >= 24)
-    return ToolResult::Error(-32602, "Voice index must be 0-23");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Voice index must be 0-23 (got {})", voice_filter));
 
   // Read global SPU status registers via offsets relative to SPU base 0x1F801C00.
   // ENDX at 0x1F801D9C => offset 0x19C
@@ -3558,14 +3625,14 @@ static ToolResult HandleInjectExecutable(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("path") || !args["path"].is_string())
-    return ToolResult::Error(-32602, "Missing 'path' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'path' parameter");
 
   std::string path;
   {
     std::string err;
     auto vp = ValidatePathArg(args, "path", &err);
     if (!vp)
-      return ToolResult::Error(-32602, std::move(err));
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, std::move(err));
     path = std::move(*vp);
   }
 
@@ -3611,7 +3678,7 @@ static ToolResult HandleStartGpuDump(const JsonValue& args)
     std::string err;
     auto vp = ValidateMCPPath(args["path"].get_string(), &err);
     if (!vp)
-      return ToolResult::Error(-32602, std::move(err));
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, std::move(err));
     path_str = std::move(*vp);
     path = path_str.c_str();
   }
@@ -4072,7 +4139,7 @@ static ToolResult HandleGetGameInfo(const JsonValue& args)
   const bool has_path = args.contains("path") && args["path"].is_string();
 
   if (!has_serial && !has_path)
-    return ToolResult::Error(-32602, "One of 'serial' or 'path' is required");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "One of 'serial' or 'path' is required");
 
   auto lock = GameList::GetLock();
   const GameList::Entry* entry = nullptr;
@@ -4172,7 +4239,7 @@ static ToolResult HandleListBios([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleGetBiosInfo(const JsonValue& args)
 {
   if (!args.contains("filename") || !args["filename"].is_string())
-    return ToolResult::Error(-32602, "Missing required 'filename' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing required 'filename' parameter");
 
   const std::string_view target_filename = args["filename"].get_string();
   const auto images = BIOS::FindBIOSImagesInDirectory(EmuFolders::Bios.c_str());
@@ -4236,7 +4303,7 @@ static ToolResult HandleGetBiosInfo(const JsonValue& args)
 static ToolResult HandleGetSaveStateInfo(const JsonValue& args)
 {
   if (!args.contains("slot") || !args["slot"].is_number_integer())
-    return ToolResult::Error(-32602, "Missing or invalid 'slot' parameter (integer required)");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing or invalid 'slot' parameter (integer required)");
 
   const s32 slot = static_cast<s32>(args["slot"].get_int());
   const bool global =
@@ -4292,11 +4359,11 @@ static ToolResult HandleGetSaveStateInfo(const JsonValue& args)
 static ToolResult HandleDeleteSaveStates(const JsonValue& args)
 {
   if (!args.contains("serial") || !args["serial"].is_string())
-    return ToolResult::Error(-32602, "Missing required 'serial' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing required 'serial' parameter");
 
   const std::string serial = std::string(args["serial"].get_string());
   if (serial.empty())
-    return ToolResult::Error(-32602, "'serial' must be a non-empty string");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "'serial' must be a non-empty string");
 
   const bool include_resume =
     (args.contains("include_resume") && args["include_resume"].is_bool()) ? args["include_resume"].get_bool() : false;
@@ -4335,7 +4402,7 @@ static ToolResult HandleUndoLoadState([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleGetSaveStateScreenshot(const JsonValue& args)
 {
   if (!args.contains("slot") || !args["slot"].is_number_integer())
-    return ToolResult::Error(-32602, "Missing or invalid 'slot' parameter (integer required)");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing or invalid 'slot' parameter (integer required)");
 
   const s32 slot = static_cast<s32>(args["slot"].get_int());
   const bool global =
@@ -4411,7 +4478,7 @@ static ToolResult HandleGetCheatDetails(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("name") || !args["name"].is_string())
-    return ToolResult::Error(-32602, "Missing 'name' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'name' parameter");
 
   const std::string name = std::string(args["name"].get_string());
   const std::string serial = System::GetGameSerial();
@@ -4469,9 +4536,9 @@ static ToolResult HandleCreateCheat(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("name") || !args["name"].is_string())
-    return ToolResult::Error(-32602, "Missing 'name' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'name' parameter");
   if (!args.contains("body") || !args["body"].is_string())
-    return ToolResult::Error(-32602, "Missing 'body' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'body' parameter");
 
   const std::string name = std::string(args["name"].get_string());
   const std::string body = std::string(args["body"].get_string());
@@ -4481,7 +4548,7 @@ static ToolResult HandleCreateCheat(const JsonValue& args)
   {
     const std::optional<Cheats::CodeType> parsed = Cheats::ParseTypeName(args["type"].get_string());
     if (!parsed.has_value())
-      return ToolResult::Error(-32602, fmt::format("Unknown cheat type: {}", args["type"].get_string()));
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Unknown cheat type: {}", args["type"].get_string()));
     type = parsed.value();
   }
 
@@ -4497,7 +4564,7 @@ static ToolResult HandleCreateCheat(const JsonValue& args)
     {
       const std::optional<Cheats::CodeActivation> parsed = Cheats::ParseActivationName(act_str);
       if (!parsed.has_value())
-        return ToolResult::Error(-32602, fmt::format("Unknown activation type: {}", act_str));
+        return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Unknown activation type: {}", act_str));
       activation = parsed.value();
     }
   }
@@ -4534,9 +4601,9 @@ static ToolResult HandleCreateCheat(const JsonValue& args)
 static ToolResult HandleImportCheats(const JsonValue& args)
 {
   if (!args.contains("content") || !args["content"].is_string())
-    return ToolResult::Error(-32602, "Missing 'content' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'content' parameter");
   if (!args.contains("format") || !args["format"].is_string())
-    return ToolResult::Error(-32602, "Missing 'format' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'format' parameter");
 
   const std::string content = std::string(args["content"].get_string());
   const std::string format_str = std::string(args["format"].get_string());
@@ -4551,7 +4618,7 @@ static ToolResult HandleImportCheats(const JsonValue& args)
   else if (format_str == "epsxe")
     file_format = Cheats::FileFormat::EPSXe;
   else
-    return ToolResult::Error(-32602, fmt::format("Unknown cheat format: {}", format_str));
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Unknown cheat format: {}", format_str));
 
   Cheats::CodeInfoList imported;
   Error error;
@@ -4585,14 +4652,14 @@ static ToolResult HandleExportCheats(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("path") || !args["path"].is_string())
-    return ToolResult::Error(-32602, "Missing 'path' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'path' parameter");
 
   std::string path;
   {
     std::string err;
     auto vp = ValidatePathArg(args, "path", &err);
     if (!vp)
-      return ToolResult::Error(-32602, std::move(err));
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, std::move(err));
     path = std::move(*vp);
   }
   const std::string serial = System::GetGameSerial();
@@ -4616,7 +4683,7 @@ static ToolResult HandleExportCheats(const JsonValue& args)
 static ToolResult HandleValidateCheat(const JsonValue& args)
 {
   if (!args.contains("body") || !args["body"].is_string())
-    return ToolResult::Error(-32602, "Missing 'body' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'body' parameter");
 
   const std::string body = std::string(args["body"].get_string());
 
@@ -4659,11 +4726,11 @@ static ToolResult HandleGetMemoryCardInfo(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("slot") || !args["slot"].is_number())
-    return ToolResult::Error(-32602, "Missing 'slot' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'slot' parameter");
 
   const u32 slot = static_cast<u32>(args["slot"].get_uint());
   if (slot > 1)
-    return ToolResult::Error(-32602, "Slot must be 0 or 1");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Slot must be 0 or 1 (got {})", slot));
 
   const MemoryCard* mc = Pad::GetMemoryCard(slot);
   if (!mc)
@@ -4712,13 +4779,13 @@ static ToolResult HandleReadMemoryCardFile(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("slot") || !args["slot"].is_number())
-    return ToolResult::Error(-32602, "Missing 'slot' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'slot' parameter");
   if (!args.contains("filename") || !args["filename"].is_string())
-    return ToolResult::Error(-32602, "Missing 'filename' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'filename' parameter");
 
   const u32 slot = static_cast<u32>(args["slot"].get_uint());
   if (slot > 1)
-    return ToolResult::Error(-32602, "Slot must be 0 or 1");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Slot must be 0 or 1 (got {})", slot));
 
   const MemoryCard* mc = Pad::GetMemoryCard(slot);
   if (!mc)
@@ -4771,13 +4838,13 @@ static ToolResult HandleDeleteMemoryCardFile(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("slot") || !args["slot"].is_number())
-    return ToolResult::Error(-32602, "Missing 'slot' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'slot' parameter");
   if (!args.contains("filename") || !args["filename"].is_string())
-    return ToolResult::Error(-32602, "Missing 'filename' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'filename' parameter");
 
   const u32 slot = static_cast<u32>(args["slot"].get_uint());
   if (slot > 1)
-    return ToolResult::Error(-32602, "Slot must be 0 or 1");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Slot must be 0 or 1 (got {})", slot));
 
   MemoryCard* mc = Pad::GetMemoryCard(slot);
   if (!mc)
@@ -4828,15 +4895,15 @@ static ToolResult HandleExportMemoryCardSave(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("slot") || !args["slot"].is_number())
-    return ToolResult::Error(-32602, "Missing 'slot' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'slot' parameter");
   if (!args.contains("filename") || !args["filename"].is_string())
-    return ToolResult::Error(-32602, "Missing 'filename' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'filename' parameter");
   if (!args.contains("output_path") || !args["output_path"].is_string())
-    return ToolResult::Error(-32602, "Missing 'output_path' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'output_path' parameter");
 
   const u32 slot = static_cast<u32>(args["slot"].get_uint());
   if (slot > 1)
-    return ToolResult::Error(-32602, "Slot must be 0 or 1");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Slot must be 0 or 1 (got {})", slot));
 
   MemoryCard* mc = Pad::GetMemoryCard(slot);
   if (!mc)
@@ -4852,7 +4919,7 @@ static ToolResult HandleExportMemoryCardSave(const JsonValue& args)
     std::string err;
     auto vp = ValidatePathArg(args, "output_path", &err);
     if (!vp)
-      return ToolResult::Error(-32602, std::move(err));
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, std::move(err));
     output_path = std::move(*vp);
   }
 
@@ -4891,13 +4958,13 @@ static ToolResult HandleImportMemoryCardSave(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("slot") || !args["slot"].is_number())
-    return ToolResult::Error(-32602, "Missing 'slot' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'slot' parameter");
   if (!args.contains("input_path") || !args["input_path"].is_string())
-    return ToolResult::Error(-32602, "Missing 'input_path' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'input_path' parameter");
 
   const u32 slot = static_cast<u32>(args["slot"].get_uint());
   if (slot > 1)
-    return ToolResult::Error(-32602, "Slot must be 0 or 1");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Slot must be 0 or 1 (got {})", slot));
 
   MemoryCard* mc = Pad::GetMemoryCard(slot);
   if (!mc)
@@ -4912,7 +4979,7 @@ static ToolResult HandleImportMemoryCardSave(const JsonValue& args)
     std::string err;
     auto vp = ValidatePathArg(args, "input_path", &err);
     if (!vp)
-      return ToolResult::Error(-32602, std::move(err));
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, std::move(err));
     input_path = std::move(*vp);
   }
 
@@ -5003,7 +5070,7 @@ static ToolResult HandleGetShaderChain([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleAddShader(const JsonValue& args)
 {
   if (!args.contains("shader_name") || !args["shader_name"].is_string())
-    return ToolResult::Error(-32602, "Missing 'shader_name' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'shader_name' parameter");
 
   const std::string shader_name = std::string(args["shader_name"].get_string());
 
@@ -5036,7 +5103,7 @@ static ToolResult HandleAddShader(const JsonValue& args)
 static ToolResult HandleRemoveShader(const JsonValue& args)
 {
   if (!args.contains("index") || !args["index"].is_number())
-    return ToolResult::Error(-32602, "Missing 'index' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'index' parameter");
 
   const u32 index = static_cast<u32>(args["index"].get_uint());
 
@@ -5049,7 +5116,7 @@ static ToolResult HandleRemoveShader(const JsonValue& args)
   const u32 stage_count = PostProcessing::Config::GetStageCount(*si, section);
 
   if (index >= stage_count)
-    return ToolResult::Error(-32602, fmt::format("Invalid stage index {} (count: {})", index, stage_count));
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Invalid stage index {} (count: {})", index, stage_count));
 
   const std::string removed_name = PostProcessing::Config::GetStageShaderName(*si, section, index);
   PostProcessing::Config::RemoveStage(*si, section, index);
@@ -5071,7 +5138,7 @@ static ToolResult HandleRemoveShader(const JsonValue& args)
 static ToolResult HandleGetShaderOptions(const JsonValue& args)
 {
   if (!args.contains("index") || !args["index"].is_number())
-    return ToolResult::Error(-32602, "Missing 'index' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'index' parameter");
 
   const u32 index = static_cast<u32>(args["index"].get_uint());
 
@@ -5084,7 +5151,7 @@ static ToolResult HandleGetShaderOptions(const JsonValue& args)
   const u32 stage_count = PostProcessing::Config::GetStageCount(*si, section);
 
   if (index >= stage_count)
-    return ToolResult::Error(-32602, fmt::format("Invalid stage index {} (count: {})", index, stage_count));
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Invalid stage index {} (count: {})", index, stage_count));
 
   const std::string shader_name = PostProcessing::Config::GetStageShaderName(*si, section, index);
   const std::vector<PostProcessing::ShaderOption> options =
@@ -5263,11 +5330,11 @@ static ToolResult HandleGetShaderOptions(const JsonValue& args)
 static ToolResult HandleSetShaderOption(const JsonValue& args)
 {
   if (!args.contains("index") || !args["index"].is_number())
-    return ToolResult::Error(-32602, "Missing 'index' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'index' parameter");
   if (!args.contains("option_name") || !args["option_name"].is_string())
-    return ToolResult::Error(-32602, "Missing 'option_name' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'option_name' parameter");
   if (!args.contains("value"))
-    return ToolResult::Error(-32602, "Missing 'value' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'value' parameter");
 
   const u32 index = static_cast<u32>(args["index"].get_uint());
   const std::string option_name = std::string(args["option_name"].get_string());
@@ -5281,7 +5348,7 @@ static ToolResult HandleSetShaderOption(const JsonValue& args)
   const u32 stage_count = PostProcessing::Config::GetStageCount(*si, section);
 
   if (index >= stage_count)
-    return ToolResult::Error(-32602, fmt::format("Invalid stage index {} (count: {})", index, stage_count));
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Invalid stage index {} (count: {})", index, stage_count));
 
   std::vector<PostProcessing::ShaderOption> options =
     PostProcessing::Config::GetStageOptions(*si, section, index);
@@ -5383,7 +5450,7 @@ static ToolResult HandleStartCapture(const JsonValue& args)
     std::string err;
     auto vp = ValidateMCPPath(args["path"].get_string(), &err);
     if (!vp)
-      return ToolResult::Error(-32602, std::move(err));
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, std::move(err));
     path = std::move(*vp);
   }
 
@@ -5701,7 +5768,7 @@ static ToolResult HandleMemoryScanReset([[maybe_unused]] const JsonValue& args)
 static ToolResult HandleAddMemoryWatch(const JsonValue& args)
 {
   if (!args.contains("address"))
-    return ToolResult::Error(-32602, "Missing 'address' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'address' parameter");
 
   // Parse address
   u32 address = 0;
@@ -5719,7 +5786,9 @@ static ToolResult HandleAddMemoryWatch(const JsonValue& args)
   }
   else
   {
-    return ToolResult::Error(-32602, "Invalid 'address' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                             fmt::format("Invalid 'address' — got {} (expected unsigned int or hex string)",
+                                         DescribeJsonForError(args["address"])));
   }
 
   // Parse size
@@ -5763,7 +5832,7 @@ static ToolResult HandleAddMemoryWatch(const JsonValue& args)
 static ToolResult HandleRemoveMemoryWatch(const JsonValue& args)
 {
   if (!args.contains("address"))
-    return ToolResult::Error(-32602, "Missing 'address' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'address' parameter");
 
   // Parse address
   u32 address = 0;
@@ -5781,7 +5850,9 @@ static ToolResult HandleRemoveMemoryWatch(const JsonValue& args)
   }
   else
   {
-    return ToolResult::Error(-32602, "Invalid 'address' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                             fmt::format("Invalid 'address' — got {} (expected unsigned int or hex string)",
+                                         DescribeJsonForError(args["address"])));
   }
 
   if (!s_memory_watch_list.RemoveEntryByAddress(address))
@@ -5877,7 +5948,7 @@ static ToolResult HandleTriggerHotkey(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("name") || !args["name"].is_string())
-    return ToolResult::Error(-32602, "Missing 'name' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'name' parameter");
 
   const std::string_view name = args["name"].get_string();
   const std::span<const HotkeyInfo> hotkeys = Core::GetHotkeyList();
@@ -5903,7 +5974,7 @@ static ToolResult HandleTriggerHotkey(const JsonValue& args)
     }
   }
 
-  return ToolResult::Error(-32602, fmt::format("Unknown hotkey '{}'", name));
+  return ToolResult::Error(JSONRPC_INVALID_PARAMS, fmt::format("Unknown hotkey '{}'", name));
 }
 
 
@@ -6115,7 +6186,7 @@ static ToolResult HandleReadDiscFile(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"No disc loaded");
 
   if (!args.contains("path") || !args["path"].is_string())
-    return ToolResult::Error(-32602, "Missing required 'path' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing required 'path' parameter");
 
   const std::string disc_path = std::string(args["path"].get_string());
 
@@ -6156,7 +6227,7 @@ static ToolResult HandleReadDiscSectors(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"No disc loaded");
 
   if (!args.contains("lba") || !args["lba"].is_number_integer())
-    return ToolResult::Error(-32602, "Missing required 'lba' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing required 'lba' parameter");
 
   const u32 lba = static_cast<u32>(args["lba"].get_int());
 
@@ -6205,7 +6276,7 @@ static ToolResult HandleReadVramRegion(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("x") || !args.contains("y") || !args.contains("width") || !args.contains("height"))
-    return ToolResult::Error(-32602, "Missing required parameters (x, y, width, height)");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing required parameters (x, y, width, height)");
 
   const u32 x = static_cast<u32>(args["x"].get_int());
   const u32 y = static_cast<u32>(args["y"].get_int());
@@ -6216,9 +6287,9 @@ static ToolResult HandleReadVramRegion(const JsonValue& args)
   static constexpr u32 VH = VRAM_HEIGHT;
 
   if (width == 0 || height == 0)
-    return ToolResult::Error(-32602, "width and height must be greater than 0");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "width and height must be greater than 0");
   if ((x + width) > VW || (y + height) > VH)
-    return ToolResult::Error(-32602,
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
                              fmt::format("Region ({},{})+({}x{}) exceeds VRAM bounds ({}x{})", x, y, width, height,
                                          VW, VH));
 
@@ -6293,7 +6364,8 @@ static ToolResult HandleReadVramRegion(const JsonValue& args)
   }
   else
   {
-    return ToolResult::Error(-32602, "Invalid format. Use 'png' or 'raw'.");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                             fmt::format("Invalid 'format' value '{}'. Use 'png' or 'raw'.", format));
   }
 }
 
@@ -6303,10 +6375,10 @@ static ToolResult HandleWriteVramRegion(const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   if (!args.contains("x") || !args.contains("y") || !args.contains("width") || !args.contains("height"))
-    return ToolResult::Error(-32602, "Missing required parameters (x, y, width, height)");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing required parameters (x, y, width, height)");
 
   if (!args.contains("input_path") || !args["input_path"].is_string())
-    return ToolResult::Error(-32602, "Missing required 'input_path' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing required 'input_path' parameter");
 
   const u32 x = static_cast<u32>(args["x"].get_int());
   const u32 y = static_cast<u32>(args["y"].get_int());
@@ -6317,9 +6389,9 @@ static ToolResult HandleWriteVramRegion(const JsonValue& args)
   static constexpr u32 VH = VRAM_HEIGHT;
 
   if (width == 0 || height == 0)
-    return ToolResult::Error(-32602, "width and height must be greater than 0");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "width and height must be greater than 0");
   if ((x + width) > VW || (y + height) > VH)
-    return ToolResult::Error(-32602,
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
                              fmt::format("Region ({},{})+({}x{}) exceeds VRAM bounds ({}x{})", x, y, width, height,
                                          VW, VH));
 
@@ -6328,7 +6400,7 @@ static ToolResult HandleWriteVramRegion(const JsonValue& args)
     std::string err;
     auto vp = ValidatePathArg(args, "input_path", &err);
     if (!vp)
-      return ToolResult::Error(-32602, std::move(err));
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, std::move(err));
     input_path = std::move(*vp);
   }
 
@@ -6337,12 +6409,12 @@ static ToolResult HandleWriteVramRegion(const JsonValue& args)
     format = std::string(args["format"].get_string());
 
   if (format != "raw")
-    return ToolResult::Error(-32602, "Currently only 'raw' format is supported for writing");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Currently only 'raw' format is supported for writing");
 
   Error error;
   auto file_data = FileSystem::ReadBinaryFile(input_path.c_str(), &error);
   if (!file_data.has_value())
-    return ToolResult::Error(-2,
+    return ToolResult::Error(MCP_ERR_OPERATION_FAILED,
                              fmt::format("Failed to read input file '{}': {}", input_path, error.GetDescription()));
 
   const u32 expected_size = width * height * sizeof(u16);
@@ -6382,7 +6454,9 @@ static ToolResult HandleSnapshotMemory(const JsonValue& args)
   {
     const auto parsed = ParseAddress(args["address"]);
     if (!parsed.has_value())
-      return ToolResult::Error(-32602, "Invalid 'address' parameter");
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                             fmt::format("Invalid 'address' — got {} (expected unsigned int or hex string)",
+                                         DescribeJsonForError(args["address"])));
     virt_addr = parsed.value();
   }
 
@@ -6397,7 +6471,7 @@ static ToolResult HandleSnapshotMemory(const JsonValue& args)
   {
     const u32 requested = static_cast<u32>(args["size"].get_int());
     if (requested == 0)
-      return ToolResult::Error(-32602, "'size' must be greater than 0");
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS, "'size' must be greater than 0");
     if (phys_addr + requested > Bus::g_ram_size)
       return ToolResult::Error(MCP_ERR_PRECONDITION_FAILED,fmt::format("Requested size {} would exceed RAM bounds", requested));
     snap_size = requested;
@@ -6492,7 +6566,9 @@ static ToolResult HandleFindFreeRam(const JsonValue& args)
   {
     const auto parsed = ParseAddress(args["start"]);
     if (!parsed.has_value())
-      return ToolResult::Error(-32602, "Invalid 'start' parameter");
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                               fmt::format("Invalid 'start' — got {} (expected unsigned int or hex string)",
+                                           DescribeJsonForError(args["start"])));
     scan_start_phys = parsed.value() & 0x1FFFFFFFu;
   }
 
@@ -6501,12 +6577,17 @@ static ToolResult HandleFindFreeRam(const JsonValue& args)
   {
     const auto parsed = ParseAddress(args["end"]);
     if (!parsed.has_value())
-      return ToolResult::Error(-32602, "Invalid 'end' parameter");
+      return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                               fmt::format("Invalid 'end' — got {} (expected unsigned int or hex string)",
+                                           DescribeJsonForError(args["end"])));
     scan_end_phys = parsed.value() & 0x1FFFFFFFu;
   }
 
   if (scan_start_phys >= scan_end_phys || scan_end_phys > Bus::g_ram_size)
-    return ToolResult::Error(-32602, "Invalid scan range");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                             fmt::format("Invalid scan range start=0x{:08X} end=0x{:08X} (RAM size 0x{:08X}); "
+                                         "require start < end ≤ RAM size",
+                                         scan_start_phys, scan_end_phys, Bus::g_ram_size));
 
   static constexpr u32 MAX_REGIONS = 50;
 
@@ -6584,7 +6665,7 @@ static ToolResult HandleGetStatusUnified(const JsonValue& args)
 static ToolResult HandleBreakpointUnified(const JsonValue& args)
 {
   if (!args.contains("action") || !args["action"].is_string())
-    return ToolResult::Error(-32602, "Missing 'action' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'action' parameter");
   const std::string action(args["action"].get_string());
   if (action == "list") return HandleListBreakpoints(args);
   if (action == "clear") return HandleClearBreakpoints(args);
@@ -6592,7 +6673,9 @@ static ToolResult HandleBreakpointUnified(const JsonValue& args)
   if (action == "remove") return HandleRemoveBreakpoint(args);
   if (action == "enable") return HandleEnableBreakpoint(args);
   if (action == "disable") return HandleDisableBreakpoint(args);
-  return ToolResult::Error(-32602, "Invalid action. Use: add, remove, list, enable, disable, clear");
+  return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                           fmt::format("Invalid 'action' value '{}'. Use: add, remove, list, enable, disable, clear",
+                                       action));
 }
 
 static ToolResult HandleGetGpuStateUnified(const JsonValue& args)
@@ -6618,81 +6701,89 @@ static ToolResult HandleGetSpuStateUnified(const JsonValue& args)
 static ToolResult HandleGetHardwareState(const JsonValue& args)
 {
   if (!args.contains("subsystem") || !args["subsystem"].is_string())
-    return ToolResult::Error(-32602, "Missing 'subsystem' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'subsystem' parameter");
   const std::string subsystem(args["subsystem"].get_string());
   if (subsystem == "dma") return HandleGetDmaState(args);
   if (subsystem == "timers") return HandleGetTimersState(args);
   if (subsystem == "interrupts") return HandleGetInterruptState(args);
   if (subsystem == "mdec") return HandleGetMdecState(args);
   if (subsystem == "timing_events") return HandleGetTimingEvents(args);
-  return ToolResult::Error(-32602, "Invalid subsystem. Use: dma, timers, interrupts, mdec, timing_events");
+  return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                           fmt::format("Invalid 'subsystem' value '{}'. Use: dma, timers, interrupts, mdec, timing_events",
+                                       subsystem));
 }
 
 static ToolResult HandleMemoryScanUnified(const JsonValue& args)
 {
   if (!args.contains("action") || !args["action"].is_string())
-    return ToolResult::Error(-32602, "Missing 'action' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'action' parameter");
   const std::string action(args["action"].get_string());
   if (action == "start") return HandleMemoryScanStart(args);
   if (action == "refine") return HandleMemoryScanRefine(args);
   if (action == "results") return HandleMemoryScanResults(args);
   if (action == "reset") return HandleMemoryScanReset(args);
-  return ToolResult::Error(-32602, "Invalid action. Use: start, refine, results, reset");
+  return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                           fmt::format("Invalid 'action' value '{}'. Use: start, refine, results, reset", action));
 }
 
 static ToolResult HandleMemoryWatchUnified(const JsonValue& args)
 {
   if (!args.contains("action") || !args["action"].is_string())
-    return ToolResult::Error(-32602, "Missing 'action' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'action' parameter");
   const std::string action(args["action"].get_string());
   if (action == "add") return HandleAddMemoryWatch(args);
   if (action == "remove") return HandleRemoveMemoryWatch(args);
   if (action == "list") return HandleListMemoryWatches(args);
-  return ToolResult::Error(-32602, "Invalid action. Use: add, remove, list");
+  return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                           fmt::format("Invalid 'action' value '{}'. Use: add, remove, list", action));
 }
 
 static ToolResult HandleVramWatchUnified(const JsonValue& args)
 {
   if (!args.contains("action") || !args["action"].is_string())
-    return ToolResult::Error(-32602, "Missing 'action' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'action' parameter");
   const std::string action(args["action"].get_string());
   if (action == "add") return HandleWatchVramWrite(args);
   if (action == "remove") return HandleRemoveVramWatch(args);
   if (action == "list") return HandleListVramWatches(args);
   if (action == "last_hit") return HandleGetVramWatchLastHit(args);
-  return ToolResult::Error(-32602, "Invalid action. Use: add, remove, list, last_hit");
+  return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                           fmt::format("Invalid 'action' value '{}'. Use: add, remove, list, last_hit", action));
 }
 
 static ToolResult HandleCaptureUnified(const JsonValue& args)
 {
   if (!args.contains("action") || !args["action"].is_string())
-    return ToolResult::Error(-32602, "Missing 'action' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'action' parameter");
   const std::string action(args["action"].get_string());
   if (action == "start") return HandleStartCapture(args);
   if (action == "stop") return HandleStopCapture(args);
   if (action == "status") return HandleGetCaptureStatus(args);
-  return ToolResult::Error(-32602, "Invalid action. Use: start, stop, status");
+  return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                           fmt::format("Invalid 'action' value '{}'. Use: start, stop, status", action));
 }
 
 static ToolResult HandleTraceUnified(const JsonValue& args)
 {
   if (!args.contains("action") || !args["action"].is_string())
-    return ToolResult::Error(-32602, "Missing 'action' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'action' parameter");
   const std::string action(args["action"].get_string());
   if (action == "start") return HandleStartTrace(args);
   if (action == "stop") return HandleStopTrace(args);
   if (action == "status") return HandleGetTraceStatus(args);
-  return ToolResult::Error(-32602, "Invalid action. Use: start, stop, status");
+  return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                           fmt::format("Invalid 'action' value '{}'. Use: start, stop, status", action));
 }
 
 static ToolResult HandleGpuDumpUnified(const JsonValue& args)
 {
   if (!args.contains("action") || !args["action"].is_string())
-    return ToolResult::Error(-32602, "Missing 'action' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'action' parameter");
   const std::string action(args["action"].get_string());
   if (action == "start") return HandleStartGpuDump(args);
   if (action == "stop") return HandleStopGpuDump(args);
-  return ToolResult::Error(-32602, "Invalid action. Use: start, stop");
+  return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                           fmt::format("Invalid 'action' value '{}'. Use: start, stop", action));
 }
 
 static ToolResult HandleGetCdromStateUnified(const JsonValue& args)
@@ -6734,13 +6825,14 @@ static ToolResult HandleSetSpeedUnified(const JsonValue& args)
 static ToolResult HandleDiscControlUnified(const JsonValue& args)
 {
   if (!args.contains("action") || !args["action"].is_string())
-    return ToolResult::Error(-32602, "Missing 'action' parameter");
+    return ToolResult::Error(JSONRPC_INVALID_PARAMS, "Missing 'action' parameter");
   const std::string action(args["action"].get_string());
   if (action == "insert") return HandleInsertDisc(args);
   if (action == "eject") return HandleEjectDisc(args);
   if (action == "switch") return HandleSwitchDisc(args);
   if (action == "list") return HandleListDiscs(args);
-  return ToolResult::Error(-32602, "Invalid action. Use: insert, eject, switch, list");
+  return ToolResult::Error(JSONRPC_INVALID_PARAMS,
+                           fmt::format("Invalid 'action' value '{}'. Use: insert, eject, switch, list", action));
 }
 
 static ToolResult HandleWaitForPause([[maybe_unused]] const JsonValue& args)
@@ -6986,7 +7078,7 @@ static ToolResult DispatchToolCall(const std::string& tool_name, const JsonValue
   else if (tool_name == "wait_for_pause")
     return HandleWaitForPause(args);
 
-  return ToolResult::Error(-32601, fmt::format("Unknown tool: {}", tool_name));
+  return ToolResult::Error(JSONRPC_METHOD_NOT_FOUND, fmt::format("Unknown tool: {}", tool_name));
 }
 
 static void LogStreamCallback(void* /*pUserParam*/, Log::MessageCategory category,
@@ -7314,7 +7406,7 @@ void MCPServer::ClientSocket::ProcessHttpRequest(const std::string& method, cons
                     m_mcp_protocol_version_header, s_negotiated_protocol_version,
                     GetRemoteAddress().ToString());
         SendHttpResponseDirect(400, "application/json",
-          MakeJsonRpcError(JsonValue(), -32600,
+          MakeJsonRpcError(JsonValue(), JSONRPC_INVALID_REQUEST,
             fmt::format("Invalid MCP-Protocol-Version (expected '{}')", s_negotiated_protocol_version)));
         return;
       }
@@ -7454,7 +7546,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
   if (!parsed.has_value())
   {
     ERROR_LOG("Failed to parse JSON-RPC request from {}", GetRemoteAddress().ToString());
-    const std::string error_response = MakeJsonRpcError(JsonValue(), -32700, "Parse error");
+    const std::string error_response = MakeJsonRpcError(JsonValue(), JSONRPC_PARSE_ERROR, "Parse error");
     SendHttpResponse(200, "application/json", error_response);
     return;
   }
@@ -7467,7 +7559,8 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
   {
     ERROR_LOG("JSON-RPC request missing or invalid 'jsonrpc' field");
     const std::string error_response =
-      MakeJsonRpcError(JsonValue(), -32600, "Invalid Request: missing or invalid 'jsonrpc' field (must be \"2.0\")");
+      MakeJsonRpcError(JsonValue(), JSONRPC_INVALID_REQUEST,
+                       "Invalid Request: missing or invalid 'jsonrpc' field (must be \"2.0\")");
     SendHttpResponse(200, "application/json", error_response);
     return;
   }
@@ -7476,7 +7569,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
   if (method_val.is_null() || !method_val.is_string())
   {
     ERROR_LOG("JSON-RPC request missing 'method' field");
-    const std::string error_response = MakeJsonRpcError(JsonValue(), -32600, "Invalid Request");
+    const std::string error_response = MakeJsonRpcError(JsonValue(), JSONRPC_INVALID_REQUEST, "Invalid Request");
     SendHttpResponse(200, "application/json", error_response);
     return;
   }
@@ -7505,7 +7598,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     if (m_mcp_session_id_header != s_mcp_session_id)
     {
       WARNING_LOG("Request missing or invalid MCP-Session-Id from {}", GetRemoteAddress().ToString());
-      const std::string error = MakeJsonRpcError(id, -32600, "Bad Request: missing or invalid MCP-Session-Id");
+      const std::string error = MakeJsonRpcError(id, JSONRPC_INVALID_REQUEST, "Bad Request: missing or invalid MCP-Session-Id");
       SendHttpResponse(400, "application/json", error);
       return;
     }
@@ -7689,7 +7782,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     const JsonValue& params = request["params"];
     if (params.is_null() || !params.is_object())
     {
-      const std::string response = MakeJsonRpcError(id, -32600, "Missing 'params' in tools/call");
+      const std::string response = MakeJsonRpcError(id, JSONRPC_INVALID_REQUEST, "Missing 'params' in tools/call");
       SendHttpResponse(200, "application/json", response);
       return;
     }
@@ -7697,7 +7790,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     const JsonValue& name_val = params["name"];
     if (name_val.is_null() || !name_val.is_string())
     {
-      const std::string response = MakeJsonRpcError(id, -32600, "Missing tool 'name' in params");
+      const std::string response = MakeJsonRpcError(id, JSONRPC_INVALID_REQUEST, "Missing tool 'name' in params");
       SendHttpResponse(200, "application/json", response);
       return;
     }
@@ -7748,7 +7841,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     const JsonValue& params = request["params"];
     if (params.is_null() || !params.is_object())
     {
-      const std::string response = MakeJsonRpcError(id, -32600, "Missing 'params' in resources/read");
+      const std::string response = MakeJsonRpcError(id, JSONRPC_INVALID_REQUEST, "Missing 'params' in resources/read");
       SendHttpResponse(200, "application/json", response);
       return;
     }
@@ -7756,7 +7849,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     const JsonValue& uri_val = params["uri"];
     if (uri_val.is_null() || !uri_val.is_string())
     {
-      const std::string response = MakeJsonRpcError(id, -32600, "Missing 'uri' in params");
+      const std::string response = MakeJsonRpcError(id, JSONRPC_INVALID_REQUEST, "Missing 'uri' in params");
       SendHttpResponse(200, "application/json", response);
       return;
     }
@@ -7794,7 +7887,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
           const ToolResult mem_result = HandleReadMemory(mem_args.value());
           if (mem_result.IsError())
           {
-            const std::string response = MakeJsonRpcError(id, -2, mem_result.text);
+            const std::string response = MakeJsonRpcError(id, MCP_ERR_OPERATION_FAILED, mem_result.text);
             SendHttpResponse(200, "application/json", response);
             return;
           }
@@ -7802,14 +7895,16 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
         }
         else
         {
-          const std::string response = MakeJsonRpcError(id, -32602, "Invalid size in memory URI");
+          const std::string response =
+            MakeJsonRpcError(id, JSONRPC_INVALID_PARAMS,
+                             fmt::format("Invalid size '{}' in memory URI (expected unsigned int)", size_str));
           SendHttpResponse(200, "application/json", response);
           return;
         }
       }
       else
       {
-        const std::string response = MakeJsonRpcError(id, -32602, "Invalid memory URI format. Use: emulator://memory/{address}/{size}");
+        const std::string response = MakeJsonRpcError(id, JSONRPC_INVALID_PARAMS, "Invalid memory URI format. Use: emulator://memory/{address}/{size}");
         SendHttpResponse(200, "application/json", response);
         return;
       }
@@ -7819,7 +7914,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
       const ToolResult map_result = HandleGetMemoryMap(JsonValue());
       if (map_result.IsError())
       {
-        const std::string response = MakeJsonRpcError(id, -2, map_result.text);
+        const std::string response = MakeJsonRpcError(id, MCP_ERR_OPERATION_FAILED, map_result.text);
         SendHttpResponse(200, "application/json", response);
         return;
       }
@@ -7827,7 +7922,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     }
     else
     {
-      const std::string response = MakeJsonRpcError(id, -32602, fmt::format("Unknown resource URI: {}", uri));
+      const std::string response = MakeJsonRpcError(id, JSONRPC_INVALID_PARAMS, fmt::format("Unknown resource URI: {}", uri));
       SendHttpResponse(200, "application/json", response);
       return;
     }
@@ -7851,7 +7946,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     const JsonValue& params = request["params"];
     if (params.is_null() || !params.is_object())
     {
-      const std::string response = MakeJsonRpcError(id, -32600, "Missing 'params' in resources/subscribe");
+      const std::string response = MakeJsonRpcError(id, JSONRPC_INVALID_REQUEST, "Missing 'params' in resources/subscribe");
       SendHttpResponse(200, "application/json", response);
       return;
     }
@@ -7859,7 +7954,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     const JsonValue& uri_val = params["uri"];
     if (uri_val.is_null() || !uri_val.is_string())
     {
-      const std::string response = MakeJsonRpcError(id, -32600, "Missing 'uri' in params");
+      const std::string response = MakeJsonRpcError(id, JSONRPC_INVALID_REQUEST, "Missing 'uri' in params");
       SendHttpResponse(200, "application/json", response);
       return;
     }
@@ -7879,7 +7974,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     const JsonValue& params = request["params"];
     if (params.is_null() || !params.is_object())
     {
-      const std::string response = MakeJsonRpcError(id, -32600, "Missing 'params' in resources/unsubscribe");
+      const std::string response = MakeJsonRpcError(id, JSONRPC_INVALID_REQUEST, "Missing 'params' in resources/unsubscribe");
       SendHttpResponse(200, "application/json", response);
       return;
     }
@@ -7887,7 +7982,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     const JsonValue& uri_val = params["uri"];
     if (uri_val.is_null() || !uri_val.is_string())
     {
-      const std::string response = MakeJsonRpcError(id, -32600, "Missing 'uri' in params");
+      const std::string response = MakeJsonRpcError(id, JSONRPC_INVALID_REQUEST, "Missing 'uri' in params");
       SendHttpResponse(200, "application/json", response);
       return;
     }
@@ -7917,7 +8012,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     const JsonValue& params = request["params"];
     if (params.is_null() || !params.is_object())
     {
-      const std::string response = MakeJsonRpcError(id, -32600, "Missing 'params' in prompts/get");
+      const std::string response = MakeJsonRpcError(id, JSONRPC_INVALID_REQUEST, "Missing 'params' in prompts/get");
       SendHttpResponse(200, "application/json", response);
       return;
     }
@@ -7925,7 +8020,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     const JsonValue& name_val = params["name"];
     if (name_val.is_null() || !name_val.is_string())
     {
-      const std::string response = MakeJsonRpcError(id, -32600, "Missing prompt 'name' in params");
+      const std::string response = MakeJsonRpcError(id, JSONRPC_INVALID_REQUEST, "Missing prompt 'name' in params");
       SendHttpResponse(200, "application/json", response);
       return;
     }
@@ -7977,7 +8072,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     {
       if (prompt_args.is_null() || !prompt_args.contains("address"))
       {
-        const std::string response = MakeJsonRpcError(id, -32602, "Missing required argument 'address'");
+        const std::string response = MakeJsonRpcError(id, JSONRPC_INVALID_PARAMS, "Missing required argument 'address'");
         SendHttpResponse(200, "application/json", response);
         return;
       }
@@ -7985,7 +8080,10 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
       auto parsed_addr = ParseAddress(prompt_args["address"]);
       if (!parsed_addr.has_value())
       {
-        const std::string response = MakeJsonRpcError(id, -32602, "Invalid address");
+        const std::string response = MakeJsonRpcError(
+          id, JSONRPC_INVALID_PARAMS,
+          fmt::format("Invalid 'address' — got {} (expected unsigned int or hex string)",
+                      DescribeJsonForError(prompt_args["address"])));
         SendHttpResponse(200, "application/json", response);
         return;
       }
@@ -8016,7 +8114,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     {
       if (prompt_args.is_null() || !prompt_args.contains("address"))
       {
-        const std::string response = MakeJsonRpcError(id, -32602, "Missing required argument 'address'");
+        const std::string response = MakeJsonRpcError(id, JSONRPC_INVALID_PARAMS, "Missing required argument 'address'");
         SendHttpResponse(200, "application/json", response);
         return;
       }
@@ -8024,7 +8122,10 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
       auto parsed_addr = ParseAddress(prompt_args["address"]);
       if (!parsed_addr.has_value())
       {
-        const std::string response = MakeJsonRpcError(id, -32602, "Invalid address");
+        const std::string response = MakeJsonRpcError(
+          id, JSONRPC_INVALID_PARAMS,
+          fmt::format("Invalid 'address' — got {} (expected unsigned int or hex string)",
+                      DescribeJsonForError(prompt_args["address"])));
         SendHttpResponse(200, "application/json", response);
         return;
       }
@@ -8054,7 +8155,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     }
     else
     {
-      const std::string response = MakeJsonRpcError(id, -32602, fmt::format("Unknown prompt: {}", prompt_name));
+      const std::string response = MakeJsonRpcError(id, JSONRPC_INVALID_PARAMS, fmt::format("Unknown prompt: {}", prompt_name));
       SendHttpResponse(200, "application/json", response);
       return;
     }
@@ -8085,7 +8186,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     const JsonValue& params = request["params"];
     if (params.is_null() || !params.is_object())
     {
-      const std::string response = MakeJsonRpcError(id, -32600, "Missing 'params' in logging/setLevel");
+      const std::string response = MakeJsonRpcError(id, JSONRPC_INVALID_REQUEST, "Missing 'params' in logging/setLevel");
       SendHttpResponse(200, "application/json", response);
       return;
     }
@@ -8093,7 +8194,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     const JsonValue& level_val = params["level"];
     if (level_val.is_null() || !level_val.is_string())
     {
-      const std::string response = MakeJsonRpcError(id, -32602, "Missing 'level' parameter (string)");
+      const std::string response = MakeJsonRpcError(id, JSONRPC_INVALID_PARAMS, "Missing 'level' parameter (string)");
       SendHttpResponse(200, "application/json", response);
       return;
     }
@@ -8111,7 +8212,9 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     else
     {
       const std::string response =
-        MakeJsonRpcError(id, -32602, "Invalid level. Must be 'error', 'warning', 'info', or 'debug'");
+        MakeJsonRpcError(id, JSONRPC_INVALID_PARAMS,
+                         fmt::format("Invalid 'level' value '{}'. Must be 'error', 'warning', 'info', or 'debug'",
+                                     level_str));
       SendHttpResponse(200, "application/json", response);
       return;
     }
@@ -8132,7 +8235,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     const JsonValue& params = request["params"];
     if (params.is_null() || !params.is_object())
     {
-      const std::string response = MakeJsonRpcError(id, -32600, "Missing 'params' in completion/complete");
+      const std::string response = MakeJsonRpcError(id, JSONRPC_INVALID_REQUEST, "Missing 'params' in completion/complete");
       SendHttpResponse(200, "application/json", response);
       return;
     }
@@ -8140,7 +8243,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     const JsonValue& argument_val = params["argument"];
     if (argument_val.is_null() || !argument_val.is_object())
     {
-      const std::string response = MakeJsonRpcError(id, -32602, "Missing 'argument' in params");
+      const std::string response = MakeJsonRpcError(id, JSONRPC_INVALID_PARAMS, "Missing 'argument' in params");
       SendHttpResponse(200, "application/json", response);
       return;
     }
@@ -8245,7 +8348,7 @@ void MCPServer::ClientSocket::ProcessJsonRpc(const std::string& json_body)
     }
     else
     {
-      const std::string response = MakeJsonRpcError(id, -32601, "Method not found");
+      const std::string response = MakeJsonRpcError(id, JSONRPC_METHOD_NOT_FOUND, "Method not found");
       SendHttpResponse(200, "application/json", response);
     }
   }
