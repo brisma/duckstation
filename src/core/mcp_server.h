@@ -27,6 +27,11 @@ void Shutdown();
 /// Returns true if the MCP server listen socket is active.
 bool IsActive();
 
+/// Polls the server's socket multiplexer. Called from the core thread's idle loop:
+/// upstream no longer keeps a shared multiplexer for the system to poll, so a server
+/// that owns one must have it pumped, or it accepts no connections at all.
+void PollUntil(u64 max_poll_time);
+
 void OnSystemPaused();
 void OnSystemResumed();
 

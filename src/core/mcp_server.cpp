@@ -52,7 +52,9 @@
 #include "common/small_string.h"
 #include "common/string_util.h"
 
+#include "util/media_capture.h"
 #include "util/sockets.h"
+#include "util/translation.h"
 
 #include "common/json_reader.h"
 #include "common/json_writer.h"
@@ -73,9 +75,10 @@
 
 LOG_CHANNEL(MCPServer);
 
-// NOTE: The socket multiplexer is polled from the core thread (in System::InternalExecution),
-// so all OnRead() callbacks and tool handlers execute on the core thread. No additional
-// dispatch is needed for direct CPU/memory/hardware state access.
+// NOTE: The socket multiplexer is owned by this server and polled from the core thread
+// (Core::Idle -> MCPServer::PollUntil), so all OnRead() callbacks and tool handlers execute
+// on the core thread. No additional dispatch is needed for direct CPU/memory/hardware state
+// access.
 
 struct ToolResult
 {
@@ -214,6 +217,7 @@ private:
 
 } // namespace
 
+static std::unique_ptr<SocketMultiplexer> s_mcp_multiplexer;
 static std::shared_ptr<ListenSocket> s_mcp_listen_socket;
 static std::vector<std::shared_ptr<ClientSocket>> s_mcp_clients;
 static std::vector<std::shared_ptr<ClientSocket>> s_sse_clients;
@@ -1594,7 +1598,7 @@ static ToolResult HandleBootGame(const JsonValue& args)
     params.force_software_renderer = args["force_software"].get_bool();
 
   Error error;
-  if (!System::BootSystem(std::move(params), &error))
+  if (System::BootSystem(std::move(params), &error) != System::BootResult::Success)
   {
     return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to boot game: {}", error.GetDescription()));
   }
@@ -2317,10 +2321,10 @@ static ToolResult HandleDumpRam(const JsonValue& args)
   {
     path = GetMCPTempFilePath("ram_dump", "bin");
   }
-  const u32 ram_size = Bus::g_ram_size;
+  const u32 ram_size = g_bus.ram_size;
 
   Error error;
-  if (!FileSystem::WriteBinaryFile(path.c_str(), Bus::g_ram, ram_size, &error))
+  if (!FileSystem::WriteBinaryFile(path.c_str(), g_bus.ram, ram_size, &error))
   {
     return ToolResult::Error(MCP_ERR_OPERATION_FAILED,fmt::format("Failed to write file: {}", error.GetDescription()));
   }
@@ -2341,15 +2345,15 @@ static ToolResult HandleGetGpuState([[maybe_unused]] const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   // Read GPUSTAT via the public ReadRegister interface (offset 0x04).
-  const u32 gpustat = g_gpu.ReadRegister(0x04);
+  const u32 gpustat = GPU::ReadRegister(0x04);
 
   // Get display resolution.
-  const auto [display_width, display_height] = g_gpu.GetFullDisplayResolution();
+  const auto [display_width, display_height] = GPU::GetFullDisplayResolution();
 
   // Read public CRTC/display state via inline accessors.
-  const bool interlaced = g_gpu.IsInterlacedDisplayEnabled();
-  const bool pal_mode = g_gpu.IsInPALMode();
-  const bool display_disabled = g_gpu.IsDisplayDisabled();
+  const bool interlaced = GPU::IsInterlacedDisplayEnabled();
+  const bool pal_mode = GPU::IsInPALMode();
+  const bool display_disabled = GPU::IsDisplayDisabled();
   const u8 resolution_scale = g_gpu_settings.gpu_resolution_scale;
 
   JsonWriter w;
@@ -2759,7 +2763,7 @@ static ToolResult HandleFrameStep(const JsonValue& args)
 
   // count parameter is accepted but we can only step one frame at a time.
   // The system will pause after 1 frame; the client can call frame_step again for more.
-  System::DoFrameStep();
+  System::FrameStep();
 
   JsonWriter w;
   w.StartObject();
@@ -3332,7 +3336,7 @@ static ToolResult HandleGetGpuDrawState([[maybe_unused]] const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   // GPUSTAT contains many draw-related fields.
-  const u32 gpustat = g_gpu.ReadRegister(0x04);
+  const u32 gpustat = GPU::ReadRegister(0x04);
 
   // Decode GPUSTAT draw-related fields.
   const u8 tex_page_x = (gpustat >> 0) & 0xF;
@@ -3384,10 +3388,10 @@ static ToolResult HandleGetGpuStats([[maybe_unused]] const JsonValue& args)
   // Since s_stats/s_counters are protected, we use GetStatsString/GetMemoryStatsString
   // which are public, but require a GPUBackend pointer (only on video thread).
   // Instead, report what we can from the CPU-side GPU object.
-  const auto [display_w, display_h] = g_gpu.GetFullDisplayResolution();
-  const float hfreq = g_gpu.ComputeHorizontalFrequency();
-  const float vfreq = g_gpu.ComputeVerticalFrequency();
-  const float pixel_ar = g_gpu.ComputePixelAspectRatio();
+  const auto [display_w, display_h] = GPU::GetFullDisplayResolution();
+  const float hfreq = GPU::ComputeHorizontalFrequency();
+  const float vfreq = GPU::ComputeVerticalFrequency();
+  const float pixel_ar = GPU::ComputePixelAspectRatio();
 
   JsonWriter w;
   w.StartObject();
@@ -3397,9 +3401,9 @@ static ToolResult HandleGetGpuStats([[maybe_unused]] const JsonValue& args)
   w.KeyDouble("vertical_frequency", vfreq);
   w.KeyDouble("pixel_aspect_ratio", pixel_ar);
   w.KeyUint("resolution_scale", g_gpu_settings.gpu_resolution_scale);
-  w.KeyBool("pal_mode", g_gpu.IsInPALMode());
-  w.KeyBool("interlaced", g_gpu.IsInterlacedDisplayEnabled());
-  w.KeyBool("display_disabled", g_gpu.IsDisplayDisabled());
+  w.KeyBool("pal_mode", GPU::IsInPALMode());
+  w.KeyBool("interlaced", GPU::IsInterlacedDisplayEnabled());
+  w.KeyBool("display_disabled", GPU::IsDisplayDisabled());
   w.EndObject();
   return ToolResult{w.TakeOutput()};
 }
@@ -3476,13 +3480,13 @@ static ToolResult HandleGetMemoryMap([[maybe_unused]] const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   static constexpr const char* region_names[] = {
-    "RAM", "RAM Mirror 1", "RAM Mirror 2", "RAM Mirror 3", "EXP1", "Scratchpad", "BIOS"
+    "RAM", "RAM Mirror 1", "RAM Mirror 2", "RAM Mirror 3", "EXP1", "Scratchpad", "BIOS", "VRAM", "SPU RAM"
   };
   static_assert(countof(region_names) == static_cast<u32>(Bus::MemoryRegion::Count));
 
   JsonWriter w;
   w.StartObject();
-  w.KeyUint("ram_size", Bus::g_ram_size);
+  w.KeyUint("ram_size", g_bus.ram_size);
 
   w.Key("memory_regions");
   w.StartArray();
@@ -3664,7 +3668,7 @@ static ToolResult HandleStartGpuDump(const JsonValue& args)
   if (!System::IsValid())
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
-  if (g_gpu.GetGPUDump())
+  if (GPU::GetGPUDump())
     return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"GPU dump already in progress");
 
   u32 num_frames = 1;
@@ -3699,7 +3703,7 @@ static ToolResult HandleStopGpuDump([[maybe_unused]] const JsonValue& args)
   if (!System::IsValid())
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
-  if (!g_gpu.GetGPUDump())
+  if (!GPU::GetGPUDump())
     return ToolResult::Error(MCP_ERR_OPERATION_FAILED,"No GPU dump in progress");
 
   System::StopRecordingGPUDump();
@@ -3748,14 +3752,14 @@ static ToolResult HandleGetGpuCrtcState([[maybe_unused]] const JsonValue& args)
     return ToolResult::Error(MCP_ERR_SYSTEM_NOT_RUNNING,"System not running");
 
   u32 beam_ticks = 0, beam_line = 0;
-  g_gpu.GetBeamPosition(&beam_ticks, &beam_line);
+  GPU::GetBeamPosition(&beam_ticks, &beam_line);
 
-  const float hfreq = g_gpu.ComputeHorizontalFrequency();
-  const float vfreq = g_gpu.ComputeVerticalFrequency();
-  const GSVector2i video_size = g_gpu.GetCRTCVideoSize();
-  const GSVector4i active_rect = g_gpu.GetCRTCVideoActiveRect();
-  const GSVector4i vram_rect = g_gpu.GetCRTCVRAMSourceRect();
-  const auto [full_w, full_h] = g_gpu.GetFullDisplayResolution();
+  const float hfreq = GPU::ComputeHorizontalFrequency();
+  const float vfreq = GPU::ComputeVerticalFrequency();
+  const GSVector2i video_size = GPU::GetCRTCVideoSize();
+  const GSVector4i active_rect = GPU::GetCRTCVideoActiveRect();
+  const GSVector4i vram_rect = GPU::GetCRTCVRAMSourceRect();
+  const auto [full_w, full_h] = GPU::GetFullDisplayResolution();
 
   JsonWriter w;
   w.StartObject();
@@ -3784,12 +3788,12 @@ static ToolResult HandleGetGpuCrtcState([[maybe_unused]] const JsonValue& args)
 
   w.KeyUint("full_display_width", full_w);
   w.KeyUint("full_display_height", full_h);
-  w.KeyUint("active_start_line", g_gpu.GetCRTCActiveStartLine());
-  w.KeyUint("active_end_line", g_gpu.GetCRTCActiveEndLine());
-  w.KeyBool("pal_mode", g_gpu.IsInPALMode());
-  w.KeyBool("interlaced_display", g_gpu.IsInterlacedDisplayEnabled());
-  w.KeyBool("display_disabled", g_gpu.IsDisplayDisabled());
-  w.KeyDouble("pixel_aspect_ratio", g_gpu.ComputePixelAspectRatio());
+  w.KeyUint("active_start_line", GPU::GetCRTCActiveStartLine());
+  w.KeyUint("active_end_line", GPU::GetCRTCActiveEndLine());
+  w.KeyBool("pal_mode", GPU::IsInPALMode());
+  w.KeyBool("interlaced_display", GPU::IsInterlacedDisplayEnabled());
+  w.KeyBool("display_disabled", GPU::IsDisplayDisabled());
+  w.KeyDouble("pixel_aspect_ratio", GPU::ComputePixelAspectRatio());
   w.EndObject();
   return ToolResult{w.TakeOutput()};
 }
@@ -4019,12 +4023,12 @@ static void WriteGameListEntryJson(JsonWriter& w, const GameList::Entry& e)
   w.KeyInt("total_played_time", static_cast<s64>(e.total_played_time));
 
   if (e.total_played_time > 0)
-    w.KeyString("total_played_time_formatted", GameList::FormatTimespan(e.total_played_time, true));
+    w.KeyString("total_played_time_formatted", Host::FormatTimespan(e.total_played_time, true));
   else
     w.KeyString("total_played_time_formatted", "Never played");
 
   if (e.last_played_time > 0)
-    w.KeyString("last_played_time_formatted", GameList::FormatTimestamp(e.last_played_time));
+    w.KeyString("last_played_time_formatted", Host::FormatRelativeDate(e.last_played_time, false, true));
   else
     w.KeyString("last_played_time_formatted", "Never");
 
@@ -4342,7 +4346,7 @@ static ToolResult HandleGetSaveStateInfo(const JsonValue& args)
   w.KeyString("serial", info->serial);
   w.KeyString("media_path", info->media_path);
   w.KeyInt("timestamp", static_cast<s64>(info->timestamp));
-  w.KeyString("timestamp_formatted", GameList::FormatTimestamp(info->timestamp));
+  w.KeyString("timestamp_formatted", Host::FormatRelativeDate(info->timestamp, false, true));
   w.KeyBool("has_screenshot", info->screenshot.IsValid());
 
   if (info->screenshot.IsValid())
@@ -5454,7 +5458,7 @@ static ToolResult HandleStartCapture(const JsonValue& args)
     path = std::move(*vp);
   }
 
-  if (!System::StartMediaCapture(std::move(path)))
+  if (!System::StartMediaCapture(MediaCaptureMode::AudioAndVideo, std::move(path)))
     return ToolResult::Error(MCP_ERR_PRECONDITION_FAILED,"Failed to start media capture");
 
   JsonWriter w;
@@ -6017,7 +6021,7 @@ static ToolResult HandleGetAchievementsDetails([[maybe_unused]] const JsonValue&
     auto lock = Achievements::GetLock();
 
     w.KeyString("game_title", Achievements::GetCurrentGameTitle());
-    w.KeyString("game_path", Achievements::GetCurrentGamePath());
+    w.KeyString("game_path", System::GetGamePath());
     w.KeyString("game_icon_url", Achievements::GetCurrentGameBadgeURL());
     w.KeyBool("has_achievements", Achievements::HasAchievements());
     w.KeyBool("has_leaderboards", Achievements::HasLeaderboards());
@@ -6462,23 +6466,23 @@ static ToolResult HandleSnapshotMemory(const JsonValue& args)
 
   const u32 phys_addr = virt_addr & 0x1FFFFFFFu;
 
-  if (phys_addr >= Bus::g_ram_size)
+  if (phys_addr >= g_bus.ram_size)
     return ToolResult::Error(MCP_ERR_PRECONDITION_FAILED,fmt::format("Address {} is out of RAM range (RAM size: {} bytes)",
-                                             FormatHex32(virt_addr), Bus::g_ram_size));
+                                             FormatHex32(virt_addr), g_bus.ram_size));
 
-  u32 snap_size = Bus::g_ram_size - phys_addr;
+  u32 snap_size = g_bus.ram_size - phys_addr;
   if (args.contains("size") && args["size"].is_number_integer())
   {
     const u32 requested = static_cast<u32>(args["size"].get_int());
     if (requested == 0)
       return ToolResult::Error(JSONRPC_INVALID_PARAMS, "'size' must be greater than 0");
-    if (phys_addr + requested > Bus::g_ram_size)
+    if (phys_addr + requested > g_bus.ram_size)
       return ToolResult::Error(MCP_ERR_PRECONDITION_FAILED,fmt::format("Requested size {} would exceed RAM bounds", requested));
     snap_size = requested;
   }
 
   s_memory_snapshot.resize(snap_size);
-  std::memcpy(s_memory_snapshot.data(), Bus::g_ram + phys_addr, snap_size);
+  std::memcpy(s_memory_snapshot.data(), g_bus.ram + phys_addr, snap_size);
   s_snapshot_base_address = phys_addr;
   s_snapshot_size = snap_size;
 
@@ -6499,13 +6503,13 @@ static ToolResult HandleDiffMemory(const JsonValue& args)
   if (s_memory_snapshot.empty())
     return ToolResult::Error(MCP_ERR_PRECONDITION_FAILED,"No memory snapshot available — call snapshot_memory first");
 
-  if (s_snapshot_base_address + s_snapshot_size > Bus::g_ram_size)
+  if (s_snapshot_base_address + s_snapshot_size > g_bus.ram_size)
     return ToolResult::Error(MCP_ERR_PRECONDITION_FAILED,"Snapshot range is no longer valid (RAM size changed?)");
 
   static constexpr u32 MAX_CHANGES = 500;
 
   const u8* snap_ptr = s_memory_snapshot.data();
-  const u8* live_ptr = Bus::g_ram + s_snapshot_base_address;
+  const u8* live_ptr = g_bus.ram + s_snapshot_base_address;
 
   u32 total_changes = 0;
   bool truncated = false;
@@ -6572,7 +6576,7 @@ static ToolResult HandleFindFreeRam(const JsonValue& args)
     scan_start_phys = parsed.value() & 0x1FFFFFFFu;
   }
 
-  u32 scan_end_phys = Bus::g_ram_size;
+  u32 scan_end_phys = g_bus.ram_size;
   if (args.contains("end"))
   {
     const auto parsed = ParseAddress(args["end"]);
@@ -6583,11 +6587,11 @@ static ToolResult HandleFindFreeRam(const JsonValue& args)
     scan_end_phys = parsed.value() & 0x1FFFFFFFu;
   }
 
-  if (scan_start_phys >= scan_end_phys || scan_end_phys > Bus::g_ram_size)
+  if (scan_start_phys >= scan_end_phys || scan_end_phys > g_bus.ram_size)
     return ToolResult::Error(JSONRPC_INVALID_PARAMS,
                              fmt::format("Invalid scan range start=0x{:08X} end=0x{:08X} (RAM size 0x{:08X}); "
                                          "require start < end ≤ RAM size",
-                                         scan_start_phys, scan_end_phys, Bus::g_ram_size));
+                                         scan_start_phys, scan_end_phys, g_bus.ram_size));
 
   static constexpr u32 MAX_REGIONS = 50;
 
@@ -6600,7 +6604,7 @@ static ToolResult HandleFindFreeRam(const JsonValue& args)
   std::vector<FreeRegion> regions;
   regions.reserve(64);
 
-  const u8* ram = Bus::g_ram;
+  const u8* ram = g_bus.ram;
   u32 i = scan_start_phys;
   while (i < scan_end_phys)
   {
@@ -8561,15 +8565,17 @@ bool MCPServer::Initialize(u16 port, std::string_view auth_token, std::string_vi
     return false;
   }
 
-  SocketMultiplexer* multiplexer = System::GetSocketMultiplexer();
-  if (!multiplexer)
+  if (!(s_mcp_multiplexer = SocketMultiplexer::Create(&error)))
+  {
+    ERROR_LOG("Failed to create socket multiplexer: {}", error.GetDescription());
     return false;
+  }
 
-  s_mcp_listen_socket = multiplexer->CreateListenSocket<ClientSocket>(address.value(), &error);
+  s_mcp_listen_socket = s_mcp_multiplexer->CreateListenSocket<ClientSocket>(address.value(), &error);
   if (!s_mcp_listen_socket)
   {
     ERROR_LOG("Failed to create listen socket: {}", error.GetDescription());
-    System::ReleaseSocketMultiplexer();
+    s_mcp_multiplexer.reset();
     return false;
   }
 
@@ -8634,7 +8640,33 @@ void MCPServer::Shutdown()
   INFO_LOG("Stopping MCP server.");
   s_mcp_listen_socket->Close();
   s_mcp_listen_socket.reset();
-  System::ReleaseSocketMultiplexer();
+  s_mcp_multiplexer.reset();
+}
+
+void MCPServer::PollUntil(u64 max_poll_time)
+{
+  if (!s_mcp_multiplexer)
+    return;
+
+  if (max_poll_time == 0)
+  {
+    s_mcp_multiplexer->PollEventsWithTimeout(0);
+    return;
+  }
+
+  // Keep polling until we time out; a single tool call is several back-and-forth packets.
+  // Break out if the pause state changes, because a frame probably needs to run.
+  const bool was_running = System::IsRunning();
+  const bool exact = (was_running && g_settings.display_optimal_frame_pacing);
+  Timer::Value poll_start_time = Timer::GetCurrentValue();
+  for (;;)
+  {
+    const u32 sleep_ms = static_cast<u32>(Timer::ConvertValueToMilliseconds(max_poll_time - poll_start_time));
+    s_mcp_multiplexer->PollEventsWithTimeout(sleep_ms);
+    poll_start_time = Timer::GetCurrentValue();
+    if (poll_start_time >= max_poll_time || System::IsRunning() != was_running || (!exact && sleep_ms == 0))
+      break;
+  }
 }
 
 void MCPServer::OnSystemPaused()
@@ -8706,7 +8738,7 @@ bool MCPServer::OnVRAMWrite(u16 x, u16 y, u16 width, u16 height)
       for (u32 i = 0; i < 64; i++)
       {
         const u32 addr = (sp_phys + i * 4) & 0x1FFFFF;
-        std::memcpy(&s_vram_watch_hit_stack[i], Bus::g_ram + addr, sizeof(u32));
+        std::memcpy(&s_vram_watch_hit_stack[i], g_bus.ram + addr, sizeof(u32));
       }
 
       INFO_LOG("VRAM watch hit at PC=0x{:08X} RA=0x{:08X} SP=0x{:08X}, VRAM write ({},{}) {}x{}",

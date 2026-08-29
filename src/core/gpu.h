@@ -113,6 +113,11 @@ u16 GetCRTCActiveEndLine();
 // Returns the video clock frequency.
 TickCount GetCRTCFrequency();
 
+// Display state and timing, read by the MCP debug server.
+bool IsDisplayDisabled();
+float ComputeHorizontalFrequency();
+float ComputeVerticalFrequency();
+
 // Video output access.
 GSVector2i GetCRTCVideoSize();
 GSVector4i GetCRTCVideoActiveRect();

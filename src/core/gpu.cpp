@@ -112,7 +112,7 @@ static constexpr size_t MAX_POLYLINE_BUFFER_SIZE = 0x200000; // this is more of 
 } // namespace
 
 /// Returns true if no data is being sent from VRAM to the DAC or that no portion of VRAM would be visible on screen.
-static bool IsDisplayDisabled();
+bool IsDisplayDisabled();
 
 /// Returns true if interlaced rendering is enabled and force progressive scan is disabled.
 static bool IsInterlacedRenderingEnabled();
@@ -124,8 +124,8 @@ TickCount GetPendingCommandTicks();
 /// Returns true if a raster scanline or command execution is pending.
 static bool IsCommandCompletionPending();
 
-static float ComputeHorizontalFrequency();
-static float ComputeVerticalFrequency();
+float ComputeHorizontalFrequency();
+float ComputeVerticalFrequency();
 
 // Ticks for hblank/vblank.
 static void CRTCTickEvent(void*, TickCount ticks);
@@ -1457,7 +1457,7 @@ GSVector4i GPU::GetCRTCVRAMSourceRect()
   return GSVector4i::xyxy(origin, origin.add32(rc.zw()));
 }
 
-ALWAYS_INLINE bool GPU::IsDisplayDisabled()
+bool GPU::IsDisplayDisabled()
 {
   return s_locals.GPUSTAT.display_disable || s_locals.crtc_state.display_vram_width == 0 ||
          s_locals.crtc_state.display_vram_height == 0;
